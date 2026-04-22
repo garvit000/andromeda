@@ -1,10 +1,9 @@
-# ==============================================================================
-# ANDROMEDA EVALUATION ENGINE v4.0
-# Comprehensive Q&A + Text Processing + Boolean engine for hackathon evaluation.
-# Handles: arithmetic, conversions, text extraction, string ops, list ops,
-#          boolean yes/no questions, base conversions, date ops, LLM fallback.
-# Single-file Flask application - no extra pip deps beyond Flask/gunicorn.
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANDROMEDA EVALUATION ENGINE v3.0
+# Comprehensive Q&A + Text Processing engine for hackathon evaluation.
+# Handles: arithmetic, conversions, text extraction, string ops, list ops, LLM.
+# Single-file Flask application – no extra pip deps beyond Flask/gunicorn.
+# ═══════════════════════════════════════════════════════════════════════════════
 from __future__ import annotations
 
 import ast
@@ -13,13 +12,14 @@ import operator
 import re
 import json
 import os
+import hashlib
 import datetime
 import calendar
 from functools import lru_cache
 import time
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from typing import Any, Optional, Tuple
 
 from flask import Flask, jsonify, request
@@ -27,9 +27,9 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 1: CONFIGURATION & CONSTANTS
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _GEMINI_TIMEOUT = 15.0
 _GEMINI_MAX_RETRIES = 5
@@ -46,9 +46,10 @@ _MARKDOWN_ITALIC_RE = re.compile(r"\*(.+?)\*")
 _MARKDOWN_CODE_RE = re.compile(r"`(.+?)`")
 _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _CODE_FENCE_RE = re.compile(r"```[\s\S]*?```")
-_BULLET_RE = re.compile(r"^\s*[-*\u2022]\s+", re.MULTILINE)
+_BULLET_RE = re.compile(r"^\s*[-*•]\s+", re.MULTILINE)
 _NUMBERED_LIST_RE = re.compile(r"^\s*\d+[.)]\s+", re.MULTILINE)
 
+# Month names for date parsing
 _MONTHS = [
     "january", "february", "march", "april", "may", "june",
     "july", "august", "september", "october", "november", "december",
@@ -62,12 +63,20 @@ for i, m in enumerate(_MONTHS):
     _MONTH_MAP[m] = i + 1
 for i, m in enumerate(_MONTH_ABBR):
     _MONTH_MAP[m] = i + 1
+
 _MONTH_NAMES_RE = "|".join(_MONTHS + _MONTH_ABBR)
 
 
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 2: UTILITY FUNCTIONS
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _collapse_whitespace(text: str) -> str:
     return _WS_RE.sub(" ", text).strip()
@@ -78,6 +87,7 @@ def _strip_html(text: str) -> str:
 
 
 def _strip_markdown(text: str) -> str:
+    """Remove common Markdown formatting from LLM output."""
     text = _CODE_FENCE_RE.sub("", text)
     text = _MARKDOWN_HEADING_RE.sub("", text)
     text = _MARKDOWN_BOLD_RE.sub(r"\1", text)
@@ -89,6 +99,7 @@ def _strip_markdown(text: str) -> str:
 
 
 def _format_number(value: float) -> str:
+    """Format a number: integers as int, floats with reasonable precision."""
     if math.isinf(value) or math.isnan(value):
         return "undefined"
     if abs(value - round(value)) < 1e-9:
@@ -96,13 +107,17 @@ def _format_number(value: float) -> str:
     rounded = round(value, 2)
     if abs(rounded - round(rounded)) < 1e-9:
         return str(int(round(rounded)))
-    return f"{rounded:.2f}".rstrip("0").rstrip(".")
+    formatted = f"{rounded:.2f}".rstrip("0").rstrip(".")
+    return formatted
 
 
 def _extract_quoted_text(query: str) -> Optional[str]:
+    """Extract text inside quotes (single, double, or smart quotes) from a query."""
+    # Try double quotes first
     m = re.search(r'["\u201c](.+?)["\u201d]', query)
     if m:
         return m.group(1)
+    # Try single quotes
     m = re.search(r"['\u2018](.+?)['\u2019]", query)
     if m:
         return m.group(1)
@@ -110,18 +125,20 @@ def _extract_quoted_text(query: str) -> Optional[str]:
 
 
 def _extract_after_colon(query: str) -> Optional[str]:
+    """Extract text after a colon, possibly in quotes."""
     m = re.search(r":\s*(.+)$", query)
     if m:
         text = m.group(1).strip().rstrip(".")
+        # Remove surrounding quotes
         if len(text) >= 2 and text[0] in ('"', "'", "\u201c") and text[-1] in ('"', "'", "\u201d"):
             text = text[1:-1]
         return text
     return None
 
 
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 3: SAFE MATH EXPRESSION EVALUATOR
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _SAFE_OPS = {
     ast.Add: operator.add,
@@ -136,7 +153,7 @@ _SAFE_OPS = {
 }
 
 
-def _safe_eval_node(node):
+def _safe_eval_node(node: ast.AST) -> float:
     if isinstance(node, ast.Expression):
         return _safe_eval_node(node.body)
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
@@ -144,18 +161,18 @@ def _safe_eval_node(node):
     if isinstance(node, ast.BinOp):
         op_func = _SAFE_OPS.get(type(node.op))
         if op_func is None:
-            raise ValueError
+            raise ValueError("Unsupported operator")
         left = _safe_eval_node(node.left)
         right = _safe_eval_node(node.right)
         if op_func is operator.pow and right > 1000:
-            raise ValueError
+            raise ValueError("Exponent too large")
         return op_func(left, right)
     if isinstance(node, ast.UnaryOp):
         op_func = _SAFE_OPS.get(type(node.op))
         if op_func is None:
-            raise ValueError
+            raise ValueError("Unsupported unary operator")
         return op_func(_safe_eval_node(node.operand))
-    raise ValueError
+    raise ValueError("Unsupported AST node")
 
 
 def safe_math_eval(expr: str) -> Optional[float]:
@@ -170,9 +187,9 @@ def safe_math_eval(expr: str) -> Optional[float]:
         return None
 
 
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 4: ARITHMETIC ENGINE
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _ARITH_EXPR_RE = re.compile(
     r"^\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([+\-*/xX%^])\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*\??\s*$"
@@ -193,7 +210,7 @@ _OP_LABEL = {
     "pow": ("result", operator.pow),
 }
 
-_WORD_NUMBERS = {
+_WORD_NUMBERS: dict[str, float] = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
     "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
@@ -205,21 +222,23 @@ _WORD_NUMBERS = {
 _COMPOUND_NUM_RE = re.compile(
     r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
     r"[\s-]*(one|two|three|four|five|six|seven|eight|nine)\b",
-    re.IGNORECASE,
+    re.IGNORECASE
 )
 
 
-def _word_to_number(word):
+def _word_to_number(word: str) -> Optional[float]:
     word = word.strip().lower().replace("-", " ").replace("  ", " ")
     if word in _WORD_NUMBERS:
         return float(_WORD_NUMBERS[word])
     m = _COMPOUND_NUM_RE.match(word)
     if m:
-        return float(_WORD_NUMBERS.get(m.group(1).lower(), 0) + _WORD_NUMBERS.get(m.group(2).lower(), 0))
+        tens = _WORD_NUMBERS.get(m.group(1).lower(), 0)
+        ones = _WORD_NUMBERS.get(m.group(2).lower(), 0)
+        return float(tens + ones)
     return None
 
 
-def _try_parse_number(text):
+def _try_parse_number(text: str) -> Optional[float]:
     text = text.strip()
     try:
         return float(text)
@@ -247,8 +266,12 @@ _NL_PATTERNS = [
     ("div", re.compile(rf"\b(?:quotient\s+of)\s+{_NUM_OR_WORD}\s+(?:and|,)\s+{_NUM_OR_WORD}\b", re.IGNORECASE)),
 ]
 
-_SUBTRACT_FROM_RE = re.compile(rf"\bsubtract\s+{_NUM_OR_WORD}\s+from\s+{_NUM_OR_WORD}\b", re.IGNORECASE)
-_DIVIDE_BY_RE = re.compile(rf"\bdivide\s+{_NUM_OR_WORD}\s+by\s+{_NUM_OR_WORD}\b", re.IGNORECASE)
+_SUBTRACT_FROM_RE = re.compile(
+    rf"\bsubtract\s+{_NUM_OR_WORD}\s+from\s+{_NUM_OR_WORD}\b", re.IGNORECASE
+)
+_DIVIDE_BY_RE = re.compile(
+    rf"\bdivide\s+{_NUM_OR_WORD}\s+by\s+{_NUM_OR_WORD}\b", re.IGNORECASE
+)
 
 _SQRT_RE = re.compile(rf"(?:what(?:'s|\s+is)\s+)?(?:the\s+)?square\s+root\s+of\s+{_NUM}\s*\??$", re.IGNORECASE)
 _SQUARED_RE = re.compile(rf"(?:what(?:'s|\s+is)\s+)?{_NUM}\s+squared\s*\??$", re.IGNORECASE)
@@ -262,13 +285,15 @@ _GCD_RE = re.compile(rf"(?:what(?:'s|\s+is)\s+)?(?:the\s+)?(?:gcd|greatest\s+com
 _LCM_RE = re.compile(rf"(?:what(?:'s|\s+is)\s+)?(?:the\s+)?(?:lcm|least\s+common\s+multiple|lowest\s+common\s+multiple)\s+of\s+{_NUM}\s+(?:and|,)\s+{_NUM}\s*\??$", re.IGNORECASE)
 _LOG_RE = re.compile(rf"(?:what(?:'s|\s+is)\s+)?(?:the\s+)?(?:log|logarithm)\s+(?:base\s+)?{_NUM}\s+(?:of\s+)?{_NUM}\s*\??$", re.IGNORECASE)
 _NATURAL_LOG_RE = re.compile(rf"(?:what(?:'s|\s+is)\s+)?(?:the\s+)?(?:natural\s+log(?:arithm)?|ln)\s+(?:of\s+)?{_NUM}\s*\??$", re.IGNORECASE)
+_IS_PRIME_RE = re.compile(rf"is\s+{_NUM}\s+(?:a\s+)?prime(?:\s+number)?\s*\??$", re.IGNORECASE)
+_IS_EVEN_ODD_RE = re.compile(rf"is\s+{_NUM}\s+(even|odd)\s*\??$", re.IGNORECASE)
 _WHAT_IS_EXPR_RE = re.compile(
     r"(?:what(?:'s|\s+is)\s+|calculate\s+|compute\s+|evaluate\s+|solve\s+)([\d+\-*/().%^xX\s]+)\s*\??$",
     re.IGNORECASE,
 )
 
 
-def _is_prime(n):
+def _is_prime(n: int) -> bool:
     if n < 2:
         return False
     if n < 4:
@@ -283,54 +308,45 @@ def _is_prime(n):
     return True
 
 
-def _is_perfect_square(n):
-    if n < 0:
-        return False
-    root = int(math.isqrt(n))
-    return root * root == n
-
-
-def _is_perfect_cube(n):
-    if n < 0:
-        cube_root = -int(round(abs(n) ** (1.0 / 3.0)))
-    else:
-        cube_root = int(round(n ** (1.0 / 3.0)))
-    return cube_root ** 3 == n
-
-
-def _is_fibonacci(n):
-    if n < 0:
-        return False
-    # n is Fibonacci iff 5*n^2 + 4 or 5*n^2 - 4 is a perfect square
-    return _is_perfect_square(5 * n * n + 4) or _is_perfect_square(5 * n * n - 4)
-
-
-def parse_arithmetic_query(query):
-    """Parse and solve arithmetic queries. Returns answer string or None.
-    NOTE: Prime/even/odd checks are in try_boolean_question instead."""
+def parse_arithmetic_query(query: str) -> Optional[str]:
     q = query.strip()
 
     match = _ARITH_EXPR_RE.match(q)
     if match:
-        left, op_token, right = float(match.group(1)), match.group(2), float(match.group(3))
+        left = float(match.group(1))
+        op_token = match.group(2)
+        right = float(match.group(3))
         operation = _OP_MAP.get(op_token)
         if operation:
             return _solve_basic(operation, left, right)
 
-    for regex, handler in [
-        (_SQRT_RE, lambda m: f"The square root of {_format_number(float(m.group(1)))} is {_format_number(math.sqrt(float(m.group(1))))}." if float(m.group(1)) >= 0 else "The square root is undefined for negative numbers."),
-        (_SQUARED_RE, lambda m: f"{_format_number(float(m.group(1)))} squared is {_format_number(float(m.group(1)) ** 2)}."),
-        (_CUBED_RE, lambda m: f"{_format_number(float(m.group(1)))} cubed is {_format_number(float(m.group(1)) ** 3)}."),
-    ]:
-        m = regex.search(q)
-        if m:
-            return handler(m)
+    m = _SQRT_RE.search(q)
+    if m:
+        val = float(m.group(1))
+        if val < 0:
+            return "The square root is undefined for negative numbers."
+        result = math.sqrt(val)
+        return f"The square root of {_format_number(val)} is {_format_number(result)}."
+
+    m = _SQUARED_RE.search(q)
+    if m:
+        val = float(m.group(1))
+        result = val ** 2
+        return f"{_format_number(val)} squared is {_format_number(result)}."
+
+    m = _CUBED_RE.search(q)
+    if m:
+        val = float(m.group(1))
+        result = val ** 3
+        return f"{_format_number(val)} cubed is {_format_number(result)}."
 
     m = _POWER_RE.search(q)
     if m:
-        base, exp = float(m.group(1)), float(m.group(2))
+        base = float(m.group(1))
+        exp = float(m.group(2))
         try:
-            return f"{_format_number(base)} to the power of {_format_number(exp)} is {_format_number(base ** exp)}."
+            result = base ** exp
+            return f"{_format_number(base)} to the power of {_format_number(exp)} is {_format_number(result)}."
         except (OverflowError, ValueError):
             return "The result is undefined."
 
@@ -341,66 +357,98 @@ def parse_arithmetic_query(query):
             return "The factorial is undefined for negative numbers."
         if val > 170:
             return "The factorial is too large to compute."
-        return f"The factorial of {val} is {math.factorial(val)}."
+        result = math.factorial(val)
+        return f"The factorial of {val} is {result}."
 
     m = _PERCENT_OF_RE.search(q)
     if m:
-        pct, base = float(m.group(1)), float(m.group(2))
-        return f"{_format_number(pct)}% of {_format_number(base)} is {_format_number(pct / 100.0 * base)}."
+        pct = float(m.group(1))
+        base = float(m.group(2))
+        result = pct / 100.0 * base
+        return f"{_format_number(pct)}% of {_format_number(base)} is {_format_number(result)}."
 
     m = _REMAINDER_RE.search(q)
     if m:
-        left, right = float(m.group(1)), float(m.group(2))
+        left = float(m.group(1))
+        right = float(m.group(2))
         if right == 0:
             return "The remainder is undefined."
-        return f"The remainder when {_format_number(left)} is divided by {_format_number(right)} is {_format_number(left % right)}."
+        result = left % right
+        return f"The remainder when {_format_number(left)} is divided by {_format_number(right)} is {_format_number(result)}."
 
     m = _ABS_RE.search(q)
     if m:
         val = float(m.group(1))
-        return f"The absolute value of {_format_number(val)} is {_format_number(abs(val))}."
+        result = abs(val)
+        return f"The absolute value of {_format_number(val)} is {_format_number(result)}."
 
     m = _GCD_RE.search(q)
     if m:
-        a, b = int(float(m.group(1))), int(float(m.group(2)))
-        return f"The GCD of {a} and {b} is {math.gcd(a, b)}."
+        a = int(float(m.group(1)))
+        b = int(float(m.group(2)))
+        result = math.gcd(a, b)
+        return f"The GCD of {a} and {b} is {result}."
 
     m = _LCM_RE.search(q)
     if m:
-        a, b = int(float(m.group(1))), int(float(m.group(2)))
-        return f"The LCM of {a} and {b} is {abs(a * b) // math.gcd(a, b) if a and b else 0}."
+        a = int(float(m.group(1)))
+        b = int(float(m.group(2)))
+        result = abs(a * b) // math.gcd(a, b) if a and b else 0
+        return f"The LCM of {a} and {b} is {result}."
 
     m = _LOG_RE.search(q)
     if m:
-        base, val = float(m.group(1)), float(m.group(2))
+        base = float(m.group(1))
+        val = float(m.group(2))
         if val <= 0 or base <= 0 or base == 1:
             return "The logarithm is undefined."
-        return f"The logarithm base {_format_number(base)} of {_format_number(val)} is {_format_number(math.log(val) / math.log(base))}."
+        result = math.log(val) / math.log(base)
+        return f"The logarithm base {_format_number(base)} of {_format_number(val)} is {_format_number(result)}."
 
     m = _NATURAL_LOG_RE.search(q)
     if m:
         val = float(m.group(1))
         if val <= 0:
             return "The natural logarithm is undefined for non-positive numbers."
-        return f"The natural logarithm of {_format_number(val)} is {_format_number(math.log(val))}."
+        result = math.log(val)
+        return f"The natural logarithm of {_format_number(val)} is {_format_number(result)}."
 
-    # "subtract X from Y" / "divide X by Y"
+    m = _IS_PRIME_RE.search(q)
+    if m:
+        val = int(float(m.group(1)))
+        if _is_prime(val):
+            return f"Yes, {val} is a prime number."
+        else:
+            return f"No, {val} is not a prime number."
+
+    m = _IS_EVEN_ODD_RE.search(q)
+    if m:
+        val = int(float(m.group(1)))
+        check = m.group(2).lower()
+        if check == "even":
+            return f"Yes, {val} is an even number." if val % 2 == 0 else f"No, {val} is not an even number."
+        else:
+            return f"Yes, {val} is an odd number." if val % 2 != 0 else f"No, {val} is not an odd number."
+
     m = _SUBTRACT_FROM_RE.search(q)
     if m:
-        n1, n2 = _try_parse_number(m.group(1)), _try_parse_number(m.group(2))
+        n1 = _try_parse_number(m.group(1))
+        n2 = _try_parse_number(m.group(2))
         if n1 is not None and n2 is not None:
             return _solve_basic("sub", n2, n1)
 
     m = _DIVIDE_BY_RE.search(q)
     if m:
-        n1, n2 = _try_parse_number(m.group(1)), _try_parse_number(m.group(2))
+        n1 = _try_parse_number(m.group(1))
+        n2 = _try_parse_number(m.group(2))
         if n1 is not None and n2 is not None:
             return _solve_basic("div", n1, n2)
 
     for operation, pattern in _NL_PATTERNS:
         m = pattern.search(q)
         if m:
-            n1, n2 = _try_parse_number(m.group(1)), _try_parse_number(m.group(2))
+            n1 = _try_parse_number(m.group(1))
+            n2 = _try_parse_number(m.group(2))
             if n1 is not None and n2 is not None:
                 return _solve_basic(operation, n1, n2)
 
@@ -415,7 +463,9 @@ def parse_arithmetic_query(query):
 
     match = _ARITH_EXPR_SEARCH_RE.search(q)
     if match:
-        left, op_token, right = float(match.group(1)), match.group(2), float(match.group(3))
+        left = float(match.group(1))
+        op_token = match.group(2)
+        right = float(match.group(3))
         operation = _OP_MAP.get(op_token)
         if operation:
             return _solve_basic(operation, left, right)
@@ -423,7 +473,7 @@ def parse_arithmetic_query(query):
     return None
 
 
-def _solve_basic(operation, left, right):
+def _solve_basic(operation: str, left: float, right: float) -> str:
     label, op_func = _OP_LABEL.get(operation, ("result", operator.add))
     if operation == "div" and right == 0:
         return "The quotient is undefined."
@@ -434,25 +484,25 @@ def _solve_basic(operation, left, right):
     return f"The {label} is {_format_number(result)}."
 
 
-def _detect_operation_label(expr):
-    e = expr.strip()
-    if "+" in e and not any(c in e for c in "-*/^%"):
+def _detect_operation_label(expr: str) -> str:
+    expr_clean = expr.strip()
+    if "+" in expr_clean and not any(c in expr_clean for c in "-*/^%"):
         return "sum"
-    if "-" in e and not any(c in e for c in "+*/^%"):
+    if "-" in expr_clean and not any(c in expr_clean for c in "+*/^%"):
         return "difference"
-    if "*" in e and not any(c in e for c in "+-/^%"):
+    if "*" in expr_clean and not any(c in expr_clean for c in "+-/^%"):
         return "product"
-    if "/" in e and not any(c in e for c in "+-*^%"):
+    if "/" in expr_clean and not any(c in expr_clean for c in "+-*^%"):
         return "quotient"
     return "result"
 
 
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 5: UNIT CONVERSION ENGINE
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _TEMP_CONVERT_RE = re.compile(
-    rf"{_NUM}\s*[^a-zA-Z]*?(?:degrees?\s+)?"
+    rf"{_NUM}\s*°?\s*(?:degrees?\s+)?"
     r"(celsius|fahrenheit|kelvin|[CFK])\s+(?:to|in|into)\s+(?:degrees?\s+)?"
     r"(celsius|fahrenheit|kelvin|[CFK])\s*\??$",
     re.IGNORECASE,
@@ -476,418 +526,348 @@ _UNIT_CONVERT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_LENGTH_BASE = {"m": 1.0, "meter": 1.0, "meters": 1.0, "km": 1000.0, "kilometer": 1000.0, "kilometers": 1000.0, "mi": 1609.344, "mile": 1609.344, "miles": 1609.344, "ft": 0.3048, "foot": 0.3048, "feet": 0.3048, "in": 0.0254, "inch": 0.0254, "inches": 0.0254, "cm": 0.01, "centimeter": 0.01, "centimeters": 0.01}
-_MASS_BASE = {"kg": 1.0, "kilogram": 1.0, "kilograms": 1.0, "g": 0.001, "gram": 0.001, "grams": 0.001, "lb": 0.453592, "lbs": 0.453592, "pound": 0.453592, "pounds": 0.453592, "oz": 0.0283495, "ounce": 0.0283495, "ounces": 0.0283495}
-_VOLUME_BASE = {"l": 1.0, "liter": 1.0, "liters": 1.0, "gal": 3.78541, "gallon": 3.78541, "gallons": 3.78541}
-_TIME_BASE = {"sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0, "min": 60.0, "mins": 60.0, "minute": 60.0, "minutes": 60.0, "hr": 3600.0, "hrs": 3600.0, "hour": 3600.0, "hours": 3600.0, "day": 86400.0, "days": 86400.0}
+_LENGTH_BASE = {
+    "m": 1.0, "meter": 1.0, "meters": 1.0,
+    "km": 1000.0, "kilometer": 1000.0, "kilometers": 1000.0,
+    "mi": 1609.344, "mile": 1609.344, "miles": 1609.344,
+    "ft": 0.3048, "foot": 0.3048, "feet": 0.3048,
+    "in": 0.0254, "inch": 0.0254, "inches": 0.0254,
+    "cm": 0.01, "centimeter": 0.01, "centimeters": 0.01,
+}
+_MASS_BASE = {
+    "kg": 1.0, "kilogram": 1.0, "kilograms": 1.0,
+    "g": 0.001, "gram": 0.001, "grams": 0.001,
+    "lb": 0.453592, "lbs": 0.453592, "pound": 0.453592, "pounds": 0.453592,
+    "oz": 0.0283495, "ounce": 0.0283495, "ounces": 0.0283495,
+}
+_VOLUME_BASE = {
+    "l": 1.0, "liter": 1.0, "liters": 1.0,
+    "gal": 3.78541, "gallon": 3.78541, "gallons": 3.78541,
+}
+_TIME_BASE = {
+    "sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0,
+    "min": 60.0, "mins": 60.0, "minute": 60.0, "minutes": 60.0,
+    "hr": 3600.0, "hrs": 3600.0, "hour": 3600.0, "hours": 3600.0,
+    "day": 86400.0, "days": 86400.0,
+}
 _ALL_UNITS = {}
 for _d in [_LENGTH_BASE, _MASS_BASE, _VOLUME_BASE, _TIME_BASE]:
     _ALL_UNITS.update(_d)
-_UNIT_DISPLAY = {"m": "meters", "km": "kilometers", "mi": "miles", "ft": "feet", "in": "inches", "cm": "centimeters", "kg": "kilograms", "g": "grams", "lb": "pounds", "lbs": "pounds", "oz": "ounces", "l": "liters", "gal": "gallons", "sec": "seconds", "secs": "seconds", "min": "minutes", "mins": "minutes", "hr": "hours", "hrs": "hours", "day": "days", "meter": "meters", "meters": "meters", "kilometer": "kilometers", "kilometers": "kilometers", "mile": "miles", "miles": "miles", "foot": "feet", "feet": "feet", "inch": "inches", "inches": "inches", "centimeter": "centimeters", "centimeters": "centimeters", "kilogram": "kilograms", "kilograms": "kilograms", "gram": "grams", "grams": "grams", "pound": "pounds", "pounds": "pounds", "ounce": "ounces", "ounces": "ounces", "liter": "liters", "liters": "liters", "gallon": "gallons", "gallons": "gallons", "second": "seconds", "seconds": "seconds", "minute": "minutes", "minutes": "minutes", "hour": "hours", "hours": "hours", "days": "days"}
+
+_UNIT_DISPLAY = {
+    "m": "meters", "km": "kilometers", "mi": "miles", "ft": "feet",
+    "in": "inches", "cm": "centimeters",
+    "kg": "kilograms", "g": "grams", "lb": "pounds", "lbs": "pounds",
+    "oz": "ounces", "l": "liters", "gal": "gallons",
+    "sec": "seconds", "secs": "seconds", "min": "minutes", "mins": "minutes",
+    "hr": "hours", "hrs": "hours", "day": "days",
+    "meter": "meters", "meters": "meters", "kilometer": "kilometers",
+    "kilometers": "kilometers", "mile": "miles", "miles": "miles",
+    "foot": "feet", "feet": "feet", "inch": "inches", "inches": "inches",
+    "centimeter": "centimeters", "centimeters": "centimeters",
+    "kilogram": "kilograms", "kilograms": "kilograms",
+    "gram": "grams", "grams": "grams",
+    "pound": "pounds", "pounds": "pounds",
+    "ounce": "ounces", "ounces": "ounces",
+    "liter": "liters", "liters": "liters",
+    "gallon": "gallons", "gallons": "gallons",
+    "second": "seconds", "seconds": "seconds",
+    "minute": "minutes", "minutes": "minutes",
+    "hour": "hours", "hours": "hours", "days": "days",
+}
 
 
-def _same_category(u1, u2):
+def _same_category(u1: str, u2: str) -> bool:
     for cat in [_LENGTH_BASE, _MASS_BASE, _VOLUME_BASE, _TIME_BASE]:
         if u1 in cat and u2 in cat:
             return True
     return False
 
 
-def try_conversion(query):
+def try_conversion(query: str) -> Optional[str]:
     q = query.strip()
     m = _TEMP_CONVERT_RE.search(q)
     if m:
         val = float(m.group(1))
-        from_u = _TEMP_NAMES.get(m.group(2).lower(), "")
-        to_u = _TEMP_NAMES.get(m.group(3).lower(), "")
-        if from_u and to_u:
-            result = _convert_temp(val, from_u, to_u)
+        from_unit = _TEMP_NAMES.get(m.group(2).lower(), "")
+        to_unit = _TEMP_NAMES.get(m.group(3).lower(), "")
+        if from_unit and to_unit:
+            result = _convert_temp(val, from_unit, to_unit)
             if result is not None:
-                return f"{_format_number(val)} degrees {from_u} is {_format_number(result)} degrees {to_u}."
+                return f"{_format_number(val)} degrees {from_unit} is {_format_number(result)} degrees {to_unit}."
+
     m = _UNIT_CONVERT_RE.search(q)
     if m:
         val = float(m.group(1))
-        from_u, to_u = m.group(2).lower(), m.group(3).lower()
-        if from_u in _ALL_UNITS and to_u in _ALL_UNITS and _same_category(from_u, to_u):
-            result = val * _ALL_UNITS[from_u] / _ALL_UNITS[to_u]
-            return f"{_format_number(val)} {_UNIT_DISPLAY.get(from_u, from_u)} is {_format_number(result)} {_UNIT_DISPLAY.get(to_u, to_u)}."
+        from_unit = m.group(2).lower()
+        to_unit = m.group(3).lower()
+        if from_unit in _ALL_UNITS and to_unit in _ALL_UNITS and _same_category(from_unit, to_unit):
+            from_factor = _ALL_UNITS[from_unit]
+            to_factor = _ALL_UNITS[to_unit]
+            result = val * from_factor / to_factor
+            from_name = _UNIT_DISPLAY.get(from_unit, from_unit)
+            to_name = _UNIT_DISPLAY.get(to_unit, to_unit)
+            return f"{_format_number(val)} {from_name} is {_format_number(result)} {to_name}."
     return None
 
 
-def _convert_temp(val, from_u, to_u):
-    if from_u == to_u:
+def _convert_temp(val: float, from_unit: str, to_unit: str) -> Optional[float]:
+    if from_unit == to_unit:
         return val
-    c = val if from_u == "Celsius" else (val - 32) * 5.0 / 9.0 if from_u == "Fahrenheit" else val - 273.15 if from_u == "Kelvin" else None
-    if c is None:
+    if from_unit == "Celsius":
+        c = val
+    elif from_unit == "Fahrenheit":
+        c = (val - 32) * 5.0 / 9.0
+    elif from_unit == "Kelvin":
+        c = val - 273.15
+    else:
         return None
-    return c if to_u == "Celsius" else c * 9.0 / 5.0 + 32 if to_u == "Fahrenheit" else c + 273.15 if to_u == "Kelvin" else None
-
-
-# ==============================================================================
-# SECTION 6: BOOLEAN YES/NO QUESTION ENGINE (Level 3)
-# ==============================================================================
-
-def try_boolean_question(query: str) -> Optional[Tuple[str, bool]]:
-    """
-    Handle yes/no boolean questions. Returns ("YES"/"NO", True) or None.
-    All boolean answers are uppercase YES/NO in raw mode.
-    """
-    q = query.strip()
-    ql = q.lower().rstrip("?. ")
-
-    # -- Is X an even/odd number? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:an?\s+)?(even|odd)(?:\s+number)?", ql)
-    if m:
-        val = int(float(m.group(1)))
-        check = m.group(2)
-        if check == "even":
-            return ("YES" if val % 2 == 0 else "NO", True)
-        else:
-            return ("YES" if val % 2 != 0 else "NO", True)
-
-    # -- Is X a prime number? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:a\s+)?prime(?:\s+number)?", ql)
-    if m:
-        val = int(float(m.group(1)))
-        return ("YES" if _is_prime(val) else "NO", True)
-
-    # -- Is X divisible by Y? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+divisible\s+by\s+([+-]?\d+(?:\.\d+)?)", ql)
-    if m:
-        a, b = int(float(m.group(1))), int(float(m.group(2)))
-        if b == 0:
-            return ("NO", True)
-        return ("YES" if a % b == 0 else "NO", True)
-
-    # -- Is X greater/less than Y? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(greater|larger|bigger|more)\s+than\s+([+-]?\d+(?:\.\d+)?)", ql)
-    if m:
-        a, b = float(m.group(1)), float(m.group(3))
-        return ("YES" if a > b else "NO", True)
-
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(less|smaller|fewer)\s+than\s+([+-]?\d+(?:\.\d+)?)", ql)
-    if m:
-        a, b = float(m.group(1)), float(m.group(3))
-        return ("YES" if a < b else "NO", True)
-
-    # -- Is X equal to Y? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+equal\s+to\s+([+-]?\d+(?:\.\d+)?)", ql)
-    if m:
-        a, b = float(m.group(1)), float(m.group(2))
-        return ("YES" if abs(a - b) < 1e-9 else "NO", True)
-
-    # -- Is X positive/negative/zero? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:a\s+)?(positive|negative|zero)(?:\s+number)?", ql)
-    if m:
-        val = float(m.group(1))
-        check = m.group(2)
-        if check == "positive":
-            return ("YES" if val > 0 else "NO", True)
-        elif check == "negative":
-            return ("YES" if val < 0 else "NO", True)
-        else:
-            return ("YES" if val == 0 else "NO", True)
-
-    # -- Is X a perfect square? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:a\s+)?perfect\s+square", ql)
-    if m:
-        val = int(float(m.group(1)))
-        return ("YES" if _is_perfect_square(val) else "NO", True)
-
-    # -- Is X a perfect cube? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:a\s+)?perfect\s+cube", ql)
-    if m:
-        val = int(float(m.group(1)))
-        return ("YES" if _is_perfect_cube(val) else "NO", True)
-
-    # -- Is X a fibonacci number? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:a\s+)?fibonacci(?:\s+number)?", ql)
-    if m:
-        val = int(float(m.group(1)))
-        return ("YES" if _is_fibonacci(val) else "NO", True)
-
-    # -- Is X a multiple of Y? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:a\s+)?multiple\s+of\s+([+-]?\d+(?:\.\d+)?)", ql)
-    if m:
-        a, b = int(float(m.group(1))), int(float(m.group(2)))
-        if b == 0:
-            return ("NO", True)
-        return ("YES" if a % b == 0 else "NO", True)
-
-    # -- Is X a factor of Y? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:a\s+)?factor\s+of\s+([+-]?\d+(?:\.\d+)?)", ql)
-    if m:
-        a, b = int(float(m.group(1))), int(float(m.group(2)))
-        if a == 0:
-            return ("NO", True)
-        return ("YES" if b % a == 0 else "NO", True)
-
-    # -- Is X between Y and Z? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+between\s+([+-]?\d+(?:\.\d+)?)\s+and\s+([+-]?\d+(?:\.\d+)?)", ql)
-    if m:
-        val, lo, hi = float(m.group(1)), float(m.group(2)), float(m.group(3))
-        if lo > hi:
-            lo, hi = hi, lo
-        return ("YES" if lo <= val <= hi else "NO", True)
-
-    # -- Is "X" a palindrome? --
-    if re.search(r"is\s+.+\s+(?:a\s+)?palindrome", ql):
-        text = _extract_quoted_text(q)
-        if text:
-            cleaned = re.sub(r"[^a-zA-Z0-9]", "", text).lower()
-            return ("YES" if cleaned == cleaned[::-1] else "NO", True)
-        # Try without quotes - maybe the word is just in the query
-        m = re.search(r"is\s+(\w+)\s+(?:a\s+)?palindrome", ql)
-        if m:
-            word = m.group(1).lower()
-            return ("YES" if word == word[::-1] else "NO", True)
-
-    # -- Is YEAR a leap year? --
-    m = re.search(r"is\s+(\d{4})\s+(?:a\s+)?leap\s*year", ql)
-    if m:
-        year = int(m.group(1))
-        return ("YES" if calendar.isleap(year) else "NO", True)
-
-    # -- Does "X" contain "Y"? --
-    m = re.search(r'does\s+["\'](.+?)["\']\s+contain\s+["\'](.+?)["\']', q, re.IGNORECASE)
-    if m:
-        text, substr = m.group(1), m.group(2)
-        return ("YES" if substr in text else "NO", True)
-
-    # Alternate: does X contain Y (without quotes)
-    m = re.search(r"does\s+(.+?)\s+contain\s+(.+?)$", ql)
-    if m:
-        text = m.group(1).strip().strip("'\"")
-        substr = m.group(2).strip().strip("'\"").rstrip("?. ")
-        return ("YES" if substr in text else "NO", True)
-
-    # -- Is "X" empty? --
-    m = re.search(r'is\s+["\']([^"\']*?)["\']\s+(?:an?\s+)?empty(?:\s+string)?', q, re.IGNORECASE)
-    if m:
-        return ("YES" if m.group(1) == "" else "NO", True)
-
-    # -- Are X and Y equal? / Are X and Y the same? --
-    m = re.search(r"are\s+([+-]?\d+(?:\.\d+)?)\s+and\s+([+-]?\d+(?:\.\d+)?)\s+(?:equal|the\s+same)", ql)
-    if m:
-        a, b = float(m.group(1)), float(m.group(2))
-        return ("YES" if abs(a - b) < 1e-9 else "NO", True)
-
-    # -- Is X a vowel/consonant? --
-    m = re.search(r"""is\s+['""]?([a-zA-Z])['""]?\s+(?:a\s+)?(vowel|consonant)""", ql)
-    if m:
-        letter = m.group(1).lower()
-        check = m.group(2)
-        is_vowel = letter in "aeiou"
-        if check == "vowel":
-            return ("YES" if is_vowel else "NO", True)
-        else:
-            return ("YES" if not is_vowel and letter.isalpha() else "NO", True)
-
-    # -- Is X an integer/whole number? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:an?\s+)?(?:integer|whole\s+number)", ql)
-    if m:
-        val = float(m.group(1))
-        return ("YES" if val == int(val) else "NO", True)
-
-    # -- Can X be divided evenly by Y? --
-    m = re.search(r"can\s+([+-]?\d+(?:\.\d+)?)\s+be\s+divided\s+evenly\s+by\s+([+-]?\d+(?:\.\d+)?)", ql)
-    if m:
-        a, b = int(float(m.group(1))), int(float(m.group(2)))
-        if b == 0:
-            return ("NO", True)
-        return ("YES" if a % b == 0 else "NO", True)
-
-    # -- Is X a power of Y? --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:a\s+)?power\s+of\s+([+-]?\d+(?:\.\d+)?)", ql)
-    if m:
-        val, base = int(float(m.group(1))), int(float(m.group(2)))
-        if base <= 1 or val <= 0:
-            return ("NO" if val != 1 else "YES", True)
-        n = val
-        while n > 1:
-            if n % base != 0:
-                return ("NO", True)
-            n //= base
-        return ("YES", True)
-
-    # -- Generic "Is X a Y number" pattern (catch-all) --
-    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:an?\s+)?(even|odd|prime|positive|negative|zero|composite|natural|whole|rational)(?:\s+number)?", ql)
-    if m:
-        val = float(m.group(1))
-        check = m.group(2)
-        if check == "even":
-            return ("YES" if int(val) % 2 == 0 else "NO", True)
-        elif check == "odd":
-            return ("YES" if int(val) % 2 != 0 else "NO", True)
-        elif check == "prime":
-            return ("YES" if _is_prime(int(val)) else "NO", True)
-        elif check == "positive":
-            return ("YES" if val > 0 else "NO", True)
-        elif check == "negative":
-            return ("YES" if val < 0 else "NO", True)
-        elif check == "zero":
-            return ("YES" if val == 0 else "NO", True)
-        elif check == "composite":
-            v = int(val)
-            return ("YES" if v > 1 and not _is_prime(v) else "NO", True)
-        elif check == "natural":
-            return ("YES" if val > 0 and val == int(val) else "NO", True)
-        elif check == "whole":
-            return ("YES" if val >= 0 and val == int(val) else "NO", True)
-        elif check == "rational":
-            return ("YES", True)  # all representable numbers are rational
-
+    if to_unit == "Celsius":
+        return c
+    elif to_unit == "Fahrenheit":
+        return c * 9.0 / 5.0 + 32
+    elif to_unit == "Kelvin":
+        return c + 273.15
     return None
 
 
-# ==============================================================================
-# SECTION 7: TEXT EXTRACTION & PROCESSING ENGINE (Level 2)
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 6: TEXT EXTRACTION & PROCESSING ENGINE (Level 2)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-_DATE_DMY_LONG = re.compile(r"\b(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")[\s,]+(\d{4})\b", re.IGNORECASE)
-_DATE_MDY_LONG = re.compile(r"\b(" + _MONTH_NAMES_RE + r")\s+(\d{1,2})[\s,]+(\d{4})\b", re.IGNORECASE)
+# ── Date extraction patterns ──────────────────────────────────────────────────
+
+# "12 March 2024", "12 march 2024", "1 Jan 2025"
+_DATE_DMY_LONG = re.compile(
+    r"\b(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")[\s,]+(\d{4})\b", re.IGNORECASE
+)
+# "March 12, 2024", "march 12 2024"
+_DATE_MDY_LONG = re.compile(
+    r"\b(" + _MONTH_NAMES_RE + r")\s+(\d{1,2})[\s,]+(\d{4})\b", re.IGNORECASE
+)
+# "12/03/2024", "12-03-2024", "12.03.2024"
 _DATE_NUMERIC_DMY = re.compile(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})\b")
+# "2024-03-12" (ISO format)
 _DATE_ISO = re.compile(r"\b(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})\b")
+
+# ── Email pattern ─────────────────────────────────────────────────────────────
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+# ── URL pattern ───────────────────────────────────────────────────────────────
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
-_PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s\-]?)?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}")
+
+# ── Phone number pattern ──────────────────────────────────────────────────────
+_PHONE_RE = re.compile(
+    r"(?:\+?\d{1,3}[\s\-]?)?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}"
+)
+
+# ── Number extraction ─────────────────────────────────────────────────────────
 _NUMBER_IN_TEXT_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
 
 
-def _extract_dates(text):
+def _extract_dates(text: str) -> list[str]:
+    """Extract date strings from text, returning them in their original format."""
     dates = []
+
     for m in _DATE_DMY_LONG.finditer(text):
         dates.append((m.start(), m.group(0)))
+
     for m in _DATE_MDY_LONG.finditer(text):
         dates.append((m.start(), m.group(0)))
+
     for m in _DATE_ISO.finditer(text):
         dates.append((m.start(), m.group(0)))
+
     if not dates:
         for m in _DATE_NUMERIC_DMY.finditer(text):
             dates.append((m.start(), m.group(0)))
+
     dates.sort(key=lambda x: x[0])
     return [d[1] for d in dates]
 
 
-def _parse_date_to_obj(text):
+def _parse_date_to_obj(text: str) -> Optional[datetime.date]:
+    """Try to parse a text date into a datetime.date object."""
+    # "12 March 2024"
     m = _DATE_DMY_LONG.search(text)
     if m:
+        day = int(m.group(1))
         month = _MONTH_MAP.get(m.group(2).lower())
+        year = int(m.group(3))
         if month:
             try:
-                return datetime.date(int(m.group(3)), month, int(m.group(1)))
+                return datetime.date(year, month, day)
             except ValueError:
                 pass
+
+    # "March 12, 2024"
     m = _DATE_MDY_LONG.search(text)
     if m:
         month = _MONTH_MAP.get(m.group(1).lower())
+        day = int(m.group(2))
+        year = int(m.group(3))
         if month:
             try:
-                return datetime.date(int(m.group(3)), month, int(m.group(2)))
+                return datetime.date(year, month, day)
             except ValueError:
                 pass
+
+    # "2024-03-12"
     m = _DATE_ISO.search(text)
     if m:
+        year = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
         try:
-            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return datetime.date(year, month, day)
         except ValueError:
             pass
+
+    # "12/03/2024"
     m = _DATE_NUMERIC_DMY.search(text)
     if m:
-        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if y < 100:
-            y += 2000
+        day = int(m.group(1))
+        month = int(m.group(2))
+        year = int(m.group(3))
+        if year < 100:
+            year += 2000
         try:
-            return datetime.date(y, mo, d)
+            return datetime.date(year, month, day)
         except ValueError:
+            # Maybe it's MM/DD/YYYY
             try:
-                return datetime.date(y, d, mo)
+                return datetime.date(year, day, month)
             except ValueError:
                 pass
+
     return None
 
 
-def try_text_extraction(query):
+def try_text_extraction(query: str) -> Optional[Tuple[str, bool]]:
+    """
+    Handle text extraction and string processing queries.
+    Returns (answer, is_raw) or None.
+    is_raw=True means the answer is a raw value (no sentence formatting).
+    """
     q = query.strip()
     ql = q.lower()
 
+    # ── Extract date ──────────────────────────────────────────────────────
     if re.match(r"extract\s+(?:the\s+)?date", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             dates = _extract_dates(text)
             if dates:
                 return dates[0], True
 
+    # ── Extract email ─────────────────────────────────────────────────────
     if re.match(r"extract\s+(?:the\s+)?(?:email|e-mail)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             emails = _EMAIL_RE.findall(text)
             if emails:
                 return emails[0], True
 
+    # ── Extract URL ───────────────────────────────────────────────────────
     if re.match(r"extract\s+(?:the\s+)?(?:url|link|website)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             urls = _URL_RE.findall(text)
             if urls:
                 return urls[0], True
 
+    # ── Extract phone number ──────────────────────────────────────────────
     if re.match(r"extract\s+(?:the\s+)?(?:phone|telephone|contact)\s*(?:number)?", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             phones = _PHONE_RE.findall(text)
             if phones:
                 return phones[0].strip(), True
 
+    # ── Extract number(s) ─────────────────────────────────────────────────
     if re.match(r"extract\s+(?:the\s+)?(?:all\s+)?numbers?", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             nums = _NUMBER_IN_TEXT_RE.findall(text)
             if nums:
-                return (", ".join(nums) if "all" in ql else nums[0]), True
+                if "all" in ql:
+                    return ", ".join(nums), True
+                return nums[0], True
 
+    # ── Extract name ──────────────────────────────────────────────────────
     if re.match(r"extract\s+(?:the\s+)?name", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
+            # Common patterns: "My name is X", "I am X", "name is X"
             m = re.search(r"(?:my\s+name\s+is|i\s+am|name\s+is|called)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)", text)
             if m:
                 return m.group(1), True
-            proper = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text)
-            common = {"the", "a", "an", "in", "on", "at", "is", "it", "my", "i", "he", "she"}
-            filtered = [n for n in proper if n.lower() not in common]
-            if filtered:
-                return filtered[0], True
+            # Fallback: just use the proper nouns
+            proper_nouns = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text)
+            if proper_nouns:
+                # Filter common words
+                common = {"the", "a", "an", "in", "on", "at", "is", "it", "my", "i", "he", "she"}
+                filtered = [n for n in proper_nouns if n.lower() not in common]
+                if filtered:
+                    return filtered[0], True
 
+    # ── Extract word(s) ───────────────────────────────────────────────────
     if re.match(r"extract\s+(?:the\s+)?(?:all\s+)?words?", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
-            m_starts = re.search(r"starting\s+with\s+['\"]?(\w)['\"]?", ql)
-            m_contains = re.search(r"containing\s+['\"]?(\w+)['\"]?", ql)
+            # Check for specific conditions like "starting with" or "containing"
+            m_starts_with = re.search(r"starting\s+with\s+['\"]?(\w)['\"]?", ql)
+            m_containing = re.search(r"containing\s+['\"]?(\w+)['\"]?", ql)
             words = text.split()
-            if m_starts:
-                words = [w for w in words if w.lower().startswith(m_starts.group(1).lower())]
-            elif m_contains:
-                words = [w for w in words if m_contains.group(1).lower() in w.lower()]
-            return ", ".join(words), True
+            if m_starts_with:
+                letter = m_starts_with.group(1).lower()
+                filtered = [w for w in words if w.lower().startswith(letter)]
+                return ", ".join(filtered), True
+            elif m_containing:
+                substr = m_containing.group(1).lower()
+                filtered = [w for w in words if substr in w.lower()]
+                return ", ".join(filtered), True
+            else:
+                return " ".join(words), True
 
-    # Generic extract X from "text"
+    # ── Generic "extract X from Y" ────────────────────────────────────────
     m = re.match(r"extract\s+(.+?)\s+from\s*[:\s]+", ql)
     if m:
         what = m.group(1).strip()
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
+            # Date fallback
             if "date" in what:
                 dates = _extract_dates(text)
                 if dates:
                     return dates[0], True
+            # Email fallback
             if "email" in what or "e-mail" in what:
                 emails = _EMAIL_RE.findall(text)
                 if emails:
                     return emails[0], True
+            # Number fallback
             if "number" in what:
                 nums = _NUMBER_IN_TEXT_RE.findall(text)
                 if nums:
                     return nums[0], True
+            # URL fallback
             if "url" in what or "link" in what:
                 urls = _URL_RE.findall(text)
                 if urls:
@@ -896,116 +876,173 @@ def try_text_extraction(query):
     return None
 
 
-def try_string_operation(query):
+def try_string_operation(query: str) -> Optional[Tuple[str, bool]]:
+    """
+    Handle string manipulation queries.
+    Returns (answer, is_raw) or None.
+    """
     q = query.strip()
     ql = q.lower()
 
-    # Reverse
+    # ── Reverse string ────────────────────────────────────────────────────
     m = re.match(r"reverse\s+(?:the\s+)?(?:string\s+)?[:\s]*(.+)$", q, re.IGNORECASE)
     if m:
         text = m.group(1).strip().rstrip(".")
+        # Remove surrounding quotes
         if len(text) >= 2 and text[0] in ('"', "'") and text[-1] in ('"', "'"):
             text = text[1:-1]
         return text[::-1], True
 
-    # Uppercase
+    # ── Uppercase ─────────────────────────────────────────────────────────
     if re.match(r"(?:convert\s+)?(?:to\s+)?(?:upper\s*case|uppercase)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             return text.upper(), True
+
     m = re.match(r"(?:convert|change|transform)\s+(.+?)\s+to\s+(?:upper\s*case|uppercase)", q, re.IGNORECASE)
     if m:
-        text = m.group(1).strip().strip("'\"")
+        text = m.group(1).strip()
+        if len(text) >= 2 and text[0] in ('"', "'") and text[-1] in ('"', "'"):
+            text = text[1:-1]
         return text.upper(), True
 
-    # Lowercase
+    # ── Lowercase ─────────────────────────────────────────────────────────
     if re.match(r"(?:convert\s+)?(?:to\s+)?(?:lower\s*case|lowercase)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             return text.lower(), True
+
     m = re.match(r"(?:convert|change|transform)\s+(.+?)\s+to\s+(?:lower\s*case|lowercase)", q, re.IGNORECASE)
     if m:
-        text = m.group(1).strip().strip("'\"")
+        text = m.group(1).strip()
+        if len(text) >= 2 and text[0] in ('"', "'") and text[-1] in ('"', "'"):
+            text = text[1:-1]
         return text.lower(), True
 
-    # Capitalize / title case
+    # ── Capitalize / Title Case ───────────────────────────────────────────
     if re.match(r"(?:capitalize|title\s*case)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             return text.title(), True
 
-    # Count words
+    # ── Count words ───────────────────────────────────────────────────────
     if re.search(r"count\s+(?:the\s+)?(?:number\s+of\s+)?words?\s+(?:in|of)", ql) or \
        re.search(r"how\s+many\s+words?\s+(?:in|are\s+in|does)", ql) or \
        re.search(r"word\s+count\s+(?:of|in|for)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
-            return str(len(text.split())), True
+            count = len(text.split())
+            return str(count), True
 
-    # Count characters
+    # ── Count characters ──────────────────────────────────────────────────
     if re.search(r"count\s+(?:the\s+)?(?:number\s+of\s+)?(?:characters?|chars?|letters?)\s+(?:in|of)", ql) or \
        re.search(r"how\s+many\s+(?:characters?|chars?|letters?)\s+(?:in|are\s+in)", ql) or \
        re.search(r"(?:character|char|letter)\s+count\s+(?:of|in|for)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             return str(len(text)), True
 
-    # Length
+    # ── Length of string ──────────────────────────────────────────────────
     if re.search(r"(?:what(?:'s|\s+is)\s+)?(?:the\s+)?length\s+of", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             return str(len(text)), True
 
-    # Remove vowels
-    if re.search(r"remove\s+(?:all\s+)?vowels?\s+(?:from|in)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+    # ── Palindrome check ──────────────────────────────────────────────────
+    if re.search(r"is\s+.+\s+(?:a\s+)?palindrome", ql):
+        text = _extract_quoted_text(q)
         if text:
-            return re.sub(r"[aeiouAEIOU]", "", text), True
+            cleaned = re.sub(r"[^a-zA-Z0-9]", "", text).lower()
+            if cleaned == cleaned[::-1]:
+                return "Yes", True
+            else:
+                return "No", True
 
-    # Remove spaces
+    # ── Remove vowels ─────────────────────────────────────────────────────
+    if re.search(r"remove\s+(?:all\s+)?vowels?\s+(?:from|in)", ql):
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
+        if text:
+            result = re.sub(r"[aeiouAEIOU]", "", text)
+            return result, True
+
+    # ── Remove spaces ─────────────────────────────────────────────────────
     if re.search(r"remove\s+(?:all\s+)?spaces?\s+(?:from|in)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
             return text.replace(" ", ""), True
 
-    # Remove duplicate chars
+    # ── Remove duplicates from string (characters) ────────────────────────
     if re.search(r"remove\s+(?:duplicate|repeated)\s+(?:characters?|chars?|letters?)", ql):
-        text = _extract_quoted_text(q) or _extract_after_colon(q)
+        text = _extract_quoted_text(q)
+        if text is None:
+            text = _extract_after_colon(q)
         if text:
-            seen, result = set(), []
+            seen = set()
+            result = []
             for ch in text:
                 if ch not in seen:
                     seen.add(ch)
                     result.append(ch)
             return "".join(result), True
 
-    # Replace X with Y in text
-    m = re.search(r"replace\s+['\"](.+?)['\"]\s+with\s+['\"](.+?)['\"]\s+in\s+['\"](.+?)['\"]", q, re.IGNORECASE)
+    # ── Replace X with Y in text ──────────────────────────────────────────
+    m = re.search(
+        r"replace\s+['\"](.+?)['\"]\s+with\s+['\"](.+?)['\"]\s+in\s+['\"](.+?)['\"]",
+        q, re.IGNORECASE,
+    )
     if m:
-        return m.group(3).replace(m.group(1), m.group(2)), True
-    m = re.search(r"replace\s+['\"]?(.+?)['\"]?\s+with\s+['\"]?(.+?)['\"]?\s+in\s*:\s*['\"](.+?)['\"]", q, re.IGNORECASE)
-    if m:
-        return m.group(3).replace(m.group(1), m.group(2)), True
+        old = m.group(1)
+        new = m.group(2)
+        text = m.group(3)
+        return text.replace(old, new), True
 
-    # Concatenate
+    # Alternate: replace X with Y in: "text"
+    m = re.search(
+        r"replace\s+['\"]?(.+?)['\"]?\s+with\s+['\"]?(.+?)['\"]?\s+in\s*:\s*['\"](.+?)['\"]",
+        q, re.IGNORECASE,
+    )
+    if m:
+        old = m.group(1)
+        new = m.group(2)
+        text = m.group(3)
+        return text.replace(old, new), True
+
+    # ── Concatenate strings ───────────────────────────────────────────────
     if re.search(r"concatenate|concat|join|combine\s+(?:the\s+)?strings?", ql):
         strings = re.findall(r'["\'](.+?)["\']', q)
         if len(strings) >= 2:
             return "".join(strings), True
 
-    # Trim/strip
+    # ── Trim/strip whitespace ─────────────────────────────────────────────
     if re.search(r"(?:trim|strip)\s+(?:whitespace\s+)?(?:from\s+)?", ql):
         text = _extract_quoted_text(q)
         if text:
             return text.strip(), True
 
-    # First/last N characters
+    # ── First N / Last N characters ───────────────────────────────────────
     m = re.search(r"(?:first|get\s+first)\s+(\d+)\s+(?:characters?|chars?|letters?)\s+(?:of|from|in)\s+", ql)
     if m:
         n = int(m.group(1))
         text = _extract_quoted_text(q)
         if text:
             return text[:n], True
+
     m = re.search(r"(?:last|get\s+last)\s+(\d+)\s+(?:characters?|chars?|letters?)\s+(?:of|from|in)\s+", ql)
     if m:
         n = int(m.group(1))
@@ -1013,145 +1050,211 @@ def try_string_operation(query):
         if text:
             return text[-n:], True
 
-    # Substring/slice
+    # ── Substring / slice ─────────────────────────────────────────────────
     m = re.search(r"substring\s+(?:of\s+)?.*?from\s+(?:index\s+)?(\d+)\s+to\s+(?:index\s+)?(\d+)", ql)
     if m:
+        start = int(m.group(1))
+        end = int(m.group(2))
         text = _extract_quoted_text(q)
         if text:
-            return text[int(m.group(1)):int(m.group(2))], True
+            return text[start:end], True
 
-    # Repeat
+    # ── Repeat string ─────────────────────────────────────────────────────
     m = re.search(r"repeat\s+['\"](.+?)['\"]\s+(\d+)\s+times?", q, re.IGNORECASE)
     if m:
-        return m.group(1) * int(m.group(2)), True
+        text = m.group(1)
+        count = int(m.group(2))
+        return text * count, True
 
-    # Count occurrences
+    # ── Count occurrences ─────────────────────────────────────────────────
     m = re.search(r"(?:count|how\s+many)\s+(?:times?\s+)?(?:does\s+)?['\"](.+?)['\"]\s+(?:appear|occur)\s+in\s+['\"](.+?)['\"]", q, re.IGNORECASE)
     if m:
-        return str(m.group(2).count(m.group(1))), True
+        substr = m.group(1)
+        text = m.group(2)
+        return str(text.count(substr)), True
+
     m = re.search(r"count\s+(?:occurrences?\s+of\s+)?['\"](.+?)['\"]\s+in\s+['\"](.+?)['\"]", q, re.IGNORECASE)
     if m:
-        return str(m.group(2).count(m.group(1))), True
+        substr = m.group(1)
+        text = m.group(2)
+        return str(text.count(substr)), True
 
-    # Split
+    # ── Split string ──────────────────────────────────────────────────────
     m = re.search(r"split\s+['\"](.+?)['\"]\s+(?:by|on|using|with)\s+['\"](.+?)['\"]", q, re.IGNORECASE)
     if m:
-        return ", ".join(m.group(1).split(m.group(2))), True
+        text = m.group(1)
+        delim = m.group(2)
+        parts = text.split(delim)
+        return ", ".join(parts), True
 
     return None
 
 
-def try_list_operation(query):
+def try_list_operation(query: str) -> Optional[Tuple[str, bool]]:
+    """
+    Handle list/array operations.
+    Returns (answer, is_raw) or None.
+    """
     q = query.strip()
     ql = q.lower()
-
-    def _extract_numbers(text):
-        m = re.search(r"[:\s]\s*([\d+\-.,\s]+)$", text)
+    
+    # ── Helpers: extract numbers from query ──
+    def _extract_numbers_from_query(text: str) -> list[float]:
+        # Try to extract bracketed lists first
+        m = re.search(r"\[([^\]]+)\]", text)
         if m:
-            src = m.group(1)
+            nums_str = m.group(1)
         else:
-            m = re.search(r"\[([^\]]+)\]", text)
-            src = m.group(1) if m else text
-        return [float(n) for n in re.findall(r"[+-]?\d+(?:\.\d+)?", src)]
-
-    if re.search(r"sort\s+(?:the\s+)?(?:following\s+)?(?:numbers?|values?|list|array|elements?)", ql) or \
-       re.search(r"(?:arrange|order)\s+(?:the\s+)?(?:following\s+)?(?:numbers?|values?)", ql):
-        nums = _extract_numbers(q)
-        if nums:
-            if re.search(r"descending|reverse", ql):
-                nums.sort(reverse=True)
+            # Try to find numbers after punctuation (colon or question mark)
+            m = re.search(r"[:?]\s*([0-9+\-.,\s]+)", text)
+            if m:
+                nums_str = m.group(1)
             else:
-                nums.sort()
-            return ", ".join(_format_number(n) for n in nums), True
+                # Fallback: take the entire text
+                nums_str = text
+        nums = re.findall(r"[+-]?\d+(?:\.\d+)?", nums_str)
+        return [float(n) for n in nums] if nums else []
 
-    if re.search(r"sort\s+.+\s+(?:in\s+)?(?:descending|reverse)", ql):
-        nums = _extract_numbers(q)
+    def _has_action(words: list[str]) -> bool:
+        for w in words:
+            if re.search(r"\b" + re.escape(w) + r"\b", ql):
+                return True
+        return False
+
+    # ── Sort numbers (ascending) ──────────────────────────────────────────
+    if _has_action(["sort", "arrange", "order"]) and re.search(r"numbers?|values?|list|array|elements?", ql):
+        nums = _extract_numbers_from_query(q)
+        if nums:
+            nums.sort()
+            return ",".join(_format_number(n) for n in nums), True
+
+    # ── Sort in descending order ──────────────────────────────────────────
+    if re.search(r"sort", ql) and re.search(r"descending|reverse", ql):
+        nums = _extract_numbers_from_query(q)
         if nums:
             nums.sort(reverse=True)
-            return ", ".join(_format_number(n) for n in nums), True
+            return ",".join(_format_number(n) for n in nums), True
 
-    if re.search(r"(?:find\s+)?(?:the\s+)?(?:max(?:imum)?|largest|biggest|greatest)\s+(?:of|in|from|value|number)", ql):
-        nums = _extract_numbers(q)
+    # ── Find maximum / minimum ────────────────────────────────────────────
+    if _has_action(["max", "maximum", "largest", "biggest", "greatest"]) or re.search(r"largest|max(?:imum)?", ql):
+        nums = _extract_numbers_from_query(q)
         if nums:
             return _format_number(max(nums)), True
 
-    if re.search(r"(?:find\s+)?(?:the\s+)?(?:min(?:imum)?|smallest|least)\s+(?:of|in|from|value|number)", ql):
-        nums = _extract_numbers(q)
+    if _has_action(["min", "minimum", "smallest", "least"]) or re.search(r"smallest|min(?:imum)?", ql):
+        nums = _extract_numbers_from_query(q)
         if nums:
             return _format_number(min(nums)), True
 
-    if re.search(r"(?:find\s+)?(?:the\s+)?(?:sum|total)\s+(?:of|:)", ql):
-        nums = _extract_numbers(q)
-        if nums and len(nums) > 2:
+    # ── Product of numbers ───────────────────────────────────────────────
+    if _has_action(["product", "multiply"]) or re.search(r"product\s+of", ql):
+        nums = _extract_numbers_from_query(q)
+        if nums:
+            prod = 1
+            for n in nums:
+                prod *= int(n) if float(n).is_integer() else n
+            return _format_number(prod), True
+
+    # ── Sum of even/odd/all numbers ──────────────────────────────────────
+    if _has_action(["sum", "total", "add", "add up", "compute", "calculate"]) or re.search(r"what\s+is\s+the\s+sum", ql):
+        nums = _extract_numbers_from_query(q)
+        if nums:
+            if re.search(r"\beven\b", ql):
+                even_nums = [n for n in nums if int(n) % 2 == 0]
+                return _format_number(sum(even_nums)) if even_nums else "0", True
+            if re.search(r"\bodd\b", ql):
+                odd_nums = [n for n in nums if int(n) % 2 != 0]
+                return _format_number(sum(odd_nums)) if odd_nums else "0", True
+            # Otherwise sum all
             return _format_number(sum(nums)), True
 
-    if re.search(r"(?:find\s+)?(?:the\s+)?(?:average|mean|avg)\s+(?:of|:)", ql):
-        nums = _extract_numbers(q)
+    # ── Average / mean ────────────────────────────────────────────────────
+    if _has_action(["average", "mean", "avg"]) or re.search(r"what\s+is\s+the\s+average", ql):
+        nums = _extract_numbers_from_query(q)
         if nums:
             return _format_number(sum(nums) / len(nums)), True
 
-    if re.search(r"(?:find\s+)?(?:the\s+)?median\s+(?:of|:)", ql):
-        nums = _extract_numbers(q)
+    # ── Median ────────────────────────────────────────────────────────────
+    if _has_action(["median"]) or re.search(r"median", ql):
+        nums = _extract_numbers_from_query(q)
         if nums:
-            s = sorted(nums)
-            n = len(s)
-            return _format_number(s[n // 2] if n % 2 == 1 else (s[n // 2 - 1] + s[n // 2]) / 2), True
+            sorted_nums = sorted(nums)
+            n = len(sorted_nums)
+            if n % 2 == 1:
+                return _format_number(sorted_nums[n // 2]), True
+            else:
+                return _format_number((sorted_nums[n // 2 - 1] + sorted_nums[n // 2]) / 2), True
 
-    if re.search(r"(?:count|how\s+many)\s+(?:items?|elements?|numbers?|values?)\s+(?:in|are\s+in)", ql):
+    # ── Count items ───────────────────────────────────────────────────────
+    if _has_action(["count"]) or re.search(r"how\s+many\b", ql):
+        # Try to find a bracketed list first
         m = re.search(r"\[([^\]]+)\]", q)
         if m:
             items = [x.strip() for x in m.group(1).split(",") if x.strip()]
             return str(len(items)), True
-        nums = _extract_numbers(q)
+        nums = _extract_numbers_from_query(q)
         if nums:
             return str(len(nums)), True
 
+    # ── Remove duplicates from list ───────────────────────────────────────
     if re.search(r"remove\s+(?:duplicate|repeated)\s+(?:numbers?|values?|elements?|items?)", ql) or \
        re.search(r"unique\s+(?:numbers?|values?|elements?|items?)", ql):
         m = re.search(r"\[([^\]]+)\]", q)
         if m:
             items = [x.strip() for x in m.group(1).split(",") if x.strip()]
-            seen, unique = set(), []
+            seen = set()
+            unique = []
             for item in items:
                 if item not in seen:
                     seen.add(item)
                     unique.append(item)
-            return ", ".join(unique), True
-        nums = _extract_numbers(q)
+            return ",".join(unique), True
+        nums = _extract_numbers_from_query(q)
         if nums:
-            seen, unique = set(), []
+            seen = set()
+            unique = []
             for n in nums:
                 if n not in seen:
                     seen.add(n)
                     unique.append(n)
-            return ", ".join(_format_number(n) for n in unique), True
+            return ",".join(_format_number(n) for n in unique), True
 
+    # ── Find common elements ──────────────────────────────────────────────
     if re.search(r"(?:find\s+)?(?:the\s+)?(?:common|shared|intersection)\s+(?:elements?|numbers?|values?)", ql):
         brackets = re.findall(r"\[([^\]]+)\]", q)
         if len(brackets) >= 2:
             set1 = set(x.strip() for x in brackets[0].split(","))
             set2 = set(x.strip() for x in brackets[1].split(","))
-            return ", ".join(sorted(set1 & set2)), True
+            common = sorted(set1 & set2)
+            return ",".join(common), True
 
+    # ── Reverse list ──────────────────────────────────────────────────────
     if re.search(r"reverse\s+(?:the\s+)?(?:list|array|order)", ql):
         m = re.search(r"\[([^\]]+)\]", q)
         if m:
             items = [x.strip() for x in m.group(1).split(",") if x.strip()]
             return ", ".join(reversed(items)), True
+        nums = _extract_numbers_from_query(q)
+        if nums:
+            nums.reverse()
+            return ", ".join(_format_number(n) for n in nums), True
 
     return None
 
 
-def try_number_base_conversion(query):
+def try_number_base_conversion(query: str) -> Optional[Tuple[str, bool]]:
+    """Handle number base/format conversions."""
     q = query.strip()
     ql = q.lower()
 
+    # ── Binary to decimal ─────────────────────────────────────────────────
     m = re.search(r"(?:convert\s+)?(?:binary\s+)?([01]+)\s+(?:from\s+binary\s+)?to\s+decimal", ql)
     if m:
         try:
             return str(int(m.group(1), 2)), True
         except ValueError:
             pass
+
     if re.search(r"convert\s+binary\s+", ql):
         m = re.search(r"([01]+)", q)
         if m:
@@ -1160,10 +1263,17 @@ def try_number_base_conversion(query):
             except ValueError:
                 pass
 
+    # ── Decimal to binary ─────────────────────────────────────────────────
     m = re.search(r"(?:convert\s+)?(\d+)\s+(?:from\s+decimal\s+)?to\s+binary", ql)
     if m:
         return bin(int(m.group(1)))[2:], True
 
+    if re.search(r"convert\s+(?:decimal\s+)?.*to\s+binary", ql):
+        m = re.search(r"(\d+)", q)
+        if m:
+            return bin(int(m.group(1)))[2:], True
+
+    # ── Hex to decimal ────────────────────────────────────────────────────
     m = re.search(r"(?:convert\s+)?(?:hex(?:adecimal)?\s+)?([0-9a-fA-F]+)\s+(?:from\s+hex(?:adecimal)?\s+)?to\s+decimal", ql)
     if m:
         try:
@@ -1171,10 +1281,12 @@ def try_number_base_conversion(query):
         except ValueError:
             pass
 
+    # ── Decimal to hex ────────────────────────────────────────────────────
     m = re.search(r"(?:convert\s+)?(\d+)\s+(?:from\s+decimal\s+)?to\s+hex(?:adecimal)?", ql)
     if m:
         return hex(int(m.group(1)))[2:].upper(), True
 
+    # ── Octal to decimal ──────────────────────────────────────────────────
     m = re.search(r"(?:convert\s+)?(?:octal\s+)?([0-7]+)\s+(?:from\s+octal\s+)?to\s+decimal", ql)
     if m:
         try:
@@ -1182,16 +1294,19 @@ def try_number_base_conversion(query):
         except ValueError:
             pass
 
+    # ── Decimal to octal ──────────────────────────────────────────────────
     m = re.search(r"(?:convert\s+)?(\d+)\s+(?:from\s+decimal\s+)?to\s+octal", ql)
     if m:
         return oct(int(m.group(1)))[2:], True
 
+    # ── Roman to decimal ──────────────────────────────────────────────────
     m = re.search(r"(?:convert\s+)?(?:roman\s+(?:numeral\s+)?)?([IVXLCDM]+)\s+to\s+(?:decimal|number|arabic)", q)
     if m:
         result = _roman_to_int(m.group(1))
         if result > 0:
             return str(result), True
 
+    # ── Decimal to Roman ──────────────────────────────────────────────────
     m = re.search(r"(?:convert\s+)?(\d+)\s+to\s+roman(?:\s+numerals?)?", ql)
     if m:
         result = _int_to_roman(int(m.group(1)))
@@ -1201,82 +1316,110 @@ def try_number_base_conversion(query):
     return None
 
 
-def _roman_to_int(s):
-    vals = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
-    total, prev = 0, 0
+def _roman_to_int(s: str) -> int:
+    roman_vals = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    total = 0
+    prev = 0
     for ch in reversed(s.upper()):
-        val = vals.get(ch, 0)
+        val = roman_vals.get(ch, 0)
         if val == 0:
             return 0
-        total += -val if val < prev else val
+        if val < prev:
+            total -= val
+        else:
+            total += val
         prev = val
     return total
 
 
-def _int_to_roman(num):
+def _int_to_roman(num: int) -> str:
     if num <= 0 or num > 3999:
         return ""
+    vals = [
+        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+        (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+        (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+    ]
     result = []
-    for val, sym in [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]:
+    for val, sym in vals:
         while num >= val:
             result.append(sym)
             num -= val
     return "".join(result)
 
 
-def try_date_operation(query):
+def try_date_operation(query: str) -> Optional[Tuple[str, bool]]:
+    """Handle date-related queries."""
     q = query.strip()
     ql = q.lower()
 
+    # ── What day of the week ──────────────────────────────────────────────
     if re.search(r"(?:what|which)\s+day\s+(?:of\s+the\s+week|is|was)", ql):
         dt = _parse_date_to_obj(q)
         if dt:
             return calendar.day_name[dt.weekday()], True
 
+    # ── How many days between ─────────────────────────────────────────────
     if re.search(r"how\s+many\s+days?\s+(?:between|from|until|till)", ql):
         dates = _extract_dates(q)
         if len(dates) >= 2:
-            d1, d2 = _parse_date_to_obj(dates[0]), _parse_date_to_obj(dates[1])
+            d1 = _parse_date_to_obj(dates[0])
+            d2 = _parse_date_to_obj(dates[1])
             if d1 and d2:
-                return str(abs((d2 - d1).days)), True
+                delta = abs((d2 - d1).days)
+                return str(delta), True
 
+    # ── Is it a leap year ─────────────────────────────────────────────────
+    m = re.search(r"is\s+(\d{4})\s+(?:a\s+)?leap\s*year", ql)
+    if m:
+        year = int(m.group(1))
+        if calendar.isleap(year):
+            return "Yes", True
+        else:
+            return "No", True
+
+    # ── Days in month ─────────────────────────────────────────────────────
     m = re.search(r"how\s+many\s+days?\s+(?:in|are\s+in)\s+(" + _MONTH_NAMES_RE + r")(?:\s+(\d{4}))?", ql)
     if m:
         month = _MONTH_MAP.get(m.group(1).lower())
         year = int(m.group(2)) if m.group(2) else 2024
         if month:
-            return str(calendar.monthrange(year, month)[1]), True
+            days = calendar.monthrange(year, month)[1]
+            return str(days), True
 
     return None
 
 
-# ==============================================================================
-# SECTION 8: WEB CONTEXT & FALLBACKS
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 7: WEB CONTEXT & FALLBACKS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @lru_cache(maxsize=256)
-def _http_get_text(url, timeout=_WEB_TIMEOUT):
+def _http_get_text(url: str, timeout: float = _WEB_TIMEOUT) -> str:
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return ""
-    req = urlrequest.Request(url, headers={"User-Agent": "andromeda-eval-agent/4.0"})
+    req = urlrequest.Request(url, headers={"User-Agent": "andromeda-eval-agent/3.0"})
     try:
         with urlrequest.urlopen(req, timeout=timeout) as resp:
             data = resp.read(_MAX_ASSET_BYTES)
-            ct = resp.headers.get("Content-Type", "").lower()
+            content_type = resp.headers.get("Content-Type", "").lower()
     except (urlerror.URLError, TimeoutError, ValueError, OSError):
         return ""
     try:
         text = data.decode("utf-8", errors="ignore")
     except Exception:
         return ""
-    text = _strip_html(text) if ("html" in ct or "<html" in text.lower()) else _collapse_whitespace(text)
+    if "html" in content_type or "<html" in text.lower():
+        text = _strip_html(text)
+    else:
+        text = _collapse_whitespace(text)
     return text[:10000]
 
 
-def _assets_context(assets):
+def _assets_context(assets: list) -> str:
     if not assets:
         return ""
-    snippets = []
+    snippets: list[str] = []
     for url in assets[:5]:
         raw = str(url)
         snippet = _http_get_text(raw, timeout=_WEB_TIMEOUT)
@@ -1287,7 +1430,7 @@ def _assets_context(assets):
     return "\n".join(snippets)[:_MAX_CONTEXT_CHARS]
 
 
-def _extractive_answer(query, context):
+def _extractive_answer(query: str, context: str) -> str:
     if not context:
         return ""
     query_words = {w for w in _WORD_RE.findall(query.lower()) if len(w) > 2}
@@ -1295,85 +1438,114 @@ def _extractive_answer(query, context):
     if not query_words and not query_numbers:
         return ""
     candidates = re.split(r"(?<=[.!?])\s+", context)
-    best, best_score = "", -1
-    for s in candidates[:250]:
-        s = _collapse_whitespace(s)
+    best = ""
+    best_score = -1
+    for sentence in candidates[:250]:
+        s = _collapse_whitespace(sentence)
         if len(s) < 8:
             continue
-        words = set(_WORD_RE.findall(s.lower()))
+        lower = s.lower()
+        words = set(_WORD_RE.findall(lower))
+        overlap = len(query_words & words)
         nums = set(re.findall(r"[+-]?\d+(?:\.\d+)?", s))
-        score = len(query_words & words) * 2 + len(query_numbers & nums) * 3
+        num_overlap = len(query_numbers & nums)
+        score = overlap * 2 + num_overlap * 3
         if score > best_score:
-            best_score, best = score, s
-    return best if best_score > 0 else ""
+            best_score = score
+            best = s
+    if best_score <= 0:
+        return ""
+    return best
 
 
-# ==============================================================================
-# SECTION 9: WIKIPEDIA & DUCKDUCKGO
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 8: WIKIPEDIA LOOKUP
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @lru_cache(maxsize=128)
-def _wikipedia_summary(query):
+def _wikipedia_summary(query: str) -> str:
     q = _collapse_whitespace(query)
     if not q:
         return ""
+    search_endpoint = (
+        "https://en.wikipedia.org/w/api.php"
+        f"?action=opensearch&search={quote(q)}&limit=1&namespace=0&format=json"
+    )
+    search_req = urlrequest.Request(
+        search_endpoint, headers={"User-Agent": "andromeda-eval-agent/3.0"}
+    )
     try:
-        search_req = urlrequest.Request(
-            f"https://en.wikipedia.org/w/api.php?action=opensearch&search={quote(q)}&limit=1&namespace=0&format=json",
-            headers={"User-Agent": "andromeda-eval-agent/4.0"},
-        )
         with urlrequest.urlopen(search_req, timeout=3.0) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        title = data[1][0] if isinstance(data[1], list) and data[1] else ""
-    except Exception:
+            search_data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        return ""
+    title = ""
+    try:
+        titles = search_data[1]
+        if isinstance(titles, list) and titles:
+            first = titles[0]
+            if isinstance(first, str):
+                title = first
+    except (IndexError, TypeError):
         return ""
     if not title:
         return ""
+    endpoint = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title)}"
+    req = urlrequest.Request(
+        endpoint, headers={"User-Agent": "andromeda-eval-agent/3.0"}
+    )
     try:
-        req = urlrequest.Request(
-            f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title)}",
-            headers={"User-Agent": "andromeda-eval-agent/4.0"},
-        )
         with urlrequest.urlopen(req, timeout=3.0) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        extract = data.get("extract", "")
-        return _collapse_whitespace(extract) if isinstance(extract, str) else ""
-    except Exception:
+    except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError):
         return ""
-
-
-@lru_cache(maxsize=128)
-def _duckduckgo_answer(query):
-    q = _collapse_whitespace(query)
-    if not q:
-        return ""
-    try:
-        req = urlrequest.Request(
-            f"https://api.duckduckgo.com/?q={quote(q)}&format=json&no_html=1&skip_disambig=1",
-            headers={"User-Agent": "andromeda-eval-agent/4.0"},
-        )
-        with urlrequest.urlopen(req, timeout=3.0) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-    except Exception:
-        return ""
-    for key in ["AbstractText", "Answer", "Definition"]:
-        val = data.get(key, "")
-        if isinstance(val, str) and len(val.strip()) > 5:
-            return _collapse_whitespace(val)
+    extract = data.get("extract")
+    if isinstance(extract, str):
+        return _collapse_whitespace(extract)
     return ""
 
 
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 9: DUCKDUCKGO INSTANT ANSWER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@lru_cache(maxsize=128)
+def _duckduckgo_answer(query: str) -> str:
+    q = _collapse_whitespace(query)
+    if not q:
+        return ""
+    endpoint = f"https://api.duckduckgo.com/?q={quote(q)}&format=json&no_html=1&skip_disambig=1"
+    req = urlrequest.Request(
+        endpoint, headers={"User-Agent": "andromeda-eval-agent/3.0"}
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=3.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        return ""
+    abstract = data.get("AbstractText", "")
+    if abstract and isinstance(abstract, str) and len(abstract.strip()) > 10:
+        return _collapse_whitespace(abstract)
+    answer = data.get("Answer", "")
+    if answer and isinstance(answer, str) and len(answer.strip()) > 1:
+        return _collapse_whitespace(answer)
+    definition = data.get("Definition", "")
+    if definition and isinstance(definition, str) and len(definition.strip()) > 10:
+        return _collapse_whitespace(definition)
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 10: GEMINI LLM ENGINE
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _GEMINI_SYSTEM_PROMPT = """\
-You are a strict, concise answer engine. Your responses are scored by cosine similarity against expected answers.
+You are a strict, concise answer engine for an evaluation API. Your responses are scored by cosine similarity against expected answers.
 
 ABSOLUTE RULES:
-1. Output EXACTLY the answer - nothing more.
+1. Output EXACTLY the answer — nothing more.
 2. NO markdown, NO bullet points, NO numbered lists, NO bold/italic.
-3. NO introductory phrases like "Sure!", "Of course!", etc.
+3. NO introductory phrases like "Sure!", "Of course!", "Here's the answer:" etc.
 4. NO explanations, NO reasoning steps, NO disclaimers.
 5. Do NOT repeat the question.
 6. If context/assets are provided, base your answer ONLY on them.
@@ -1381,103 +1553,145 @@ ABSOLUTE RULES:
 RESPONSE FORMAT BY QUERY TYPE:
 
 A) ARITHMETIC:
-- Addition -> "The sum is X."
-- Subtraction -> "The difference is X."
-- Multiplication -> "The product is X."
-- Division -> "The quotient is X."
+- Addition → "The sum is X."
+- Subtraction → "The difference is X."
+- Multiplication → "The product is X."
+- Division → "The quotient is X."
 
-B) YES/NO QUESTIONS (Is X even? Is X prime? Is it a palindrome? etc.):
-- Return ONLY "YES" or "NO" in uppercase. Nothing else.
-
-C) EXTRACTION (extract X from text):
+B) EXTRACTION (extract X from text):
 - Return ONLY the extracted value, no sentence wrapper, no period.
+- Example: Extract date from "Meeting on 12 March 2024" → 12 March 2024
+- Example: Extract email from "Contact john@test.com" → john@test.com
 
-D) STRING/LIST OPERATIONS:
+C) STRING OPERATIONS:
 - Return ONLY the result, no sentence wrapper, no period.
+- Example: Reverse "hello" → olleh
+- Example: Convert "hello" to uppercase → HELLO
+
+D) LIST OPERATIONS:
+- Return ONLY the result values, comma-separated, no brackets.
+- Example: Sort: 5, 3, 1 → 1, 3, 5
+- Example: Max of: 10, 20, 5 → 20
 
 E) FACTUAL QUESTIONS:
 - Answer in ONE concise sentence ending with a period.
+- Example: What is the capital of France? → The capital of France is Paris.
 
 EXAMPLES:
 Q: What is 10 + 15?
 A: The sum is 25.
 
-Q: Is 9 an odd number?
-A: YES
-
-Q: Is 4 an even number?
-A: YES
-
-Q: Is 7 a prime number?
-A: YES
-
-Q: Is 10 divisible by 3?
-A: NO
-
-Q: Is 15 greater than 10?
-A: YES
-
-Q: Is "racecar" a palindrome?
-A: YES
-
-Q: Is 2024 a leap year?
-A: YES
-
-Q: Is 16 a perfect square?
-A: YES
+Q: What is 100 - 37?
+A: The difference is 63.
 
 Q: Extract date from: "Meeting on 12 March 2024".
 A: 12 March 2024
 
+Q: Extract email from: "Contact us at info@example.com for details".
+A: info@example.com
+
 Q: Reverse the string "hello".
 A: olleh
 
-Q: Sort the numbers: 5, 3, 1.
-A: 1, 3, 5
+Q: Convert "hello world" to uppercase.
+A: HELLO WORLD
+
+Q: Count words in "the quick brown fox".
+A: 4
+
+Q: Sort the numbers: 5, 3, 1, 4, 2.
+A: 1, 2, 3, 4, 5
 
 Q: What is the capital of France?
 A: The capital of France is Paris.
 
+Q: Who wrote Romeo and Juliet?
+A: Romeo and Juliet was written by William Shakespeare.
+
+Q: Is "racecar" a palindrome?
+A: Yes
+
+Q: What day of the week was January 1, 2024?
+A: Monday
+
 Q: Convert 10 to binary.
 A: 1010
 
-Q: Count words in "hello world".
-A: 2
-
-Q: Find the maximum in: 10, 20, 5.
+Q: Find the maximum in: 10, 20, 5, 15.
 A: 20
+
+Q: What is the length of "hello"?
+A: 5
+
+Q: Remove vowels from "beautiful".
+A: btfl
+
+Q: Extract all numbers from "I have 3 cats and 5 dogs".
+A: 3, 5
+
+Q: Replace "a" with "o" in "banana".
+A: bonono
 """
 
 
-def _call_gemini(query, context):
+def _call_gemini(query: str, context: str) -> Optional[str]:
     api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
     if not api_key:
         print("[EVAL-LOG] No Gemini API key found!", flush=True)
         return None
+
     model_env = os.getenv("GEMINI_MODEL", "gemini-2.0-flash,gemini-1.5-flash,gemini-2.0-flash-lite")
     model_candidates = [m.strip() for m in model_env.split(",") if m.strip()]
+
     user_prompt = f"Query: {query}"
     if context:
         user_prompt += f"\n\nContext:\n{context[:8000]}"
+
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": _GEMINI_SYSTEM_PROMPT + "\n\n" + user_prompt}]}],
-        "generationConfig": {"temperature": 0.0, "topP": 0.05, "topK": 1, "maxOutputTokens": 150, "candidateCount": 1},
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": _GEMINI_SYSTEM_PROMPT + "\n\n" + user_prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "topP": 0.05,
+            "topK": 1,
+            "maxOutputTokens": 150,
+            "candidateCount": 1,
+        },
     }
+
     for model in model_candidates:
         for attempt in range(_GEMINI_MAX_RETRIES):
-            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            endpoint = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={api_key}"
+            )
             try:
-                req = urlrequest.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+                req = urlrequest.Request(
+                    endpoint,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
                 with urlrequest.urlopen(req, timeout=_GEMINI_TIMEOUT) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                if isinstance(text, str) and text.strip():
-                    return text.strip()
+                candidate_text = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+                if isinstance(candidate_text, str) and candidate_text.strip():
+                    return candidate_text.strip()
             except urlerror.HTTPError as e:
                 status = getattr(e, "code", 0)
                 print(f"[EVAL-LOG] Gemini HTTP {status} on {model} (attempt {attempt+1}): {repr(e)}", flush=True)
                 if status == 429:
-                    time.sleep(min(_GEMINI_BACKOFF_BASE * (2 ** attempt), 10.0))
+                    wait = _GEMINI_BACKOFF_BASE * (2 ** attempt)
+                    time.sleep(min(wait, 10.0))
                     continue
                 elif status in (500, 502, 503):
                     time.sleep(1.0)
@@ -1493,165 +1707,320 @@ def _call_gemini(query, context):
     return None
 
 
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 11: OUTPUT SANITIZATION
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def sanitize_output(text):
-    """Clean sentence-mode output. Single sentence ending with period."""
+def sanitize_output(text: str) -> str:
+    """
+    Clean and normalize sentence-mode output.
+    Ensures a single sentence ending with a period.
+    """
     if not isinstance(text, str) or not text.strip():
         return "I cannot determine the answer."
+
     cleaned = _strip_markdown(text)
     cleaned = " ".join(cleaned.replace("\n", " ").split()).strip()
+
     if not cleaned:
         return "I cannot determine the answer."
-    for prefix in ["Sure!", "Sure,", "Sure.", "Of course!", "Of course,", "Of course.", "Here's the answer:", "Here is the answer:", "The answer is:", "Answer:", "A:", "Response:"]:
+
+    prefixes_to_strip = [
+        "Sure!", "Sure,", "Sure.",
+        "Of course!", "Of course,", "Of course.",
+        "Here's the answer:", "Here is the answer:",
+        "The answer is:", "Answer:",
+        "A:", "Response:",
+    ]
+    for prefix in prefixes_to_strip:
         if cleaned.lower().startswith(prefix.lower()):
             cleaned = cleaned[len(prefix):].strip()
+
     if len(cleaned) > 2 and cleaned[0] in ('"', "'") and cleaned[-1] == cleaned[0]:
         cleaned = cleaned[1:-1].strip()
+
     if not cleaned:
         return "I cannot determine the answer."
+
+    # Preserve exact arithmetic phrasing (allow decimal points)
     arith_match = re.match(
         r"^(The\s+(?:sum|difference|product|quotient|result|remainder|square\s+root|factorial|"
         r"GCD|LCM|logarithm|natural\s+logarithm|absolute\s+value)"
         r"(?:\s+(?:of|when|base))?"
         r"(?:[^.!?]|\.(?=\d))*?(?:is\s+(?:[^.!?]|\.(?=\d))+))",
-        cleaned, re.IGNORECASE,
+        cleaned,
+        re.IGNORECASE,
     )
     if arith_match:
         sentence = arith_match.group(1).strip()
-        return sentence[0].upper() + sentence[1:].rstrip(".!? ") + "."
-    m = re.search(r"[!?]|\.(?!\d)", cleaned)
-    if m:
-        cleaned = cleaned[:m.start() + 1]
+        sentence = sentence[0].upper() + sentence[1:]
+        return sentence.rstrip(".!? ") + "."
+
+    first_sentence_match = re.search(r"[!?]|\.(?!\d)", cleaned)
+    if first_sentence_match:
+        cleaned = cleaned[: first_sentence_match.start() + 1]
+
     cleaned = cleaned.strip()
     if not cleaned:
         return "I cannot determine the answer."
+
     cleaned = cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()
     return cleaned.rstrip(".!? ") + "."
 
 
-def sanitize_raw_output(text):
-    """Clean raw-mode output. Minimal processing, no sentence formatting."""
+def sanitize_raw_output(text: str) -> str:
+    """
+    Clean raw-mode output. Minimal processing — just strip markdown/whitespace.
+    No sentence formatting, no period added.
+    """
     if not isinstance(text, str) or not text.strip():
         return ""
+
     cleaned = _strip_markdown(text)
     cleaned = " ".join(cleaned.replace("\n", " ").split()).strip()
-    for prefix in ["Sure!", "Sure,", "Sure.", "Of course!", "Of course,", "Of course.", "Here's the answer:", "Here is the answer:", "The answer is:", "Answer:", "A:", "Response:"]:
+
+    # Remove common LLM prefixes
+    prefixes_to_strip = [
+        "Sure!", "Sure,", "Sure.",
+        "Of course!", "Of course,", "Of course.",
+        "Here's the answer:", "Here is the answer:",
+        "The answer is:", "Answer:",
+        "A:", "Response:",
+    ]
+    for prefix in prefixes_to_strip:
         if cleaned.lower().startswith(prefix.lower()):
             cleaned = cleaned[len(prefix):].strip()
+
+    # Remove wrapping quotes
     if len(cleaned) > 2 and cleaned[0] in ('"', "'") and cleaned[-1] == cleaned[0]:
         cleaned = cleaned[1:-1].strip()
-    # Remove trailing period if not a sentence
+
+    # Remove trailing period only if this looks like a raw value (not a sentence)
     if cleaned.endswith(".") and not re.search(r"[a-zA-Z]{3,}\.$", cleaned):
         cleaned = cleaned[:-1].strip()
+
     return cleaned
 
 
-# ==============================================================================
-# SECTION 12: MAIN ANSWER PIPELINE
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 12: NUMBER PROPERTY QUESTIONS & MAIN ANSWER PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _is_extraction_query(query):
+def try_number_property_question(query: str) -> Optional[Tuple[str, bool]]:
+    """Handle yes/no questions about number properties (odd/even, prime, etc.)"""
     ql = query.lower().strip()
-    patterns = [
+    
+    # Extract number from query (with optional leading negative sign)
+    number_match = re.search(r'([+-]?\d+(?:\.\d+)?)', ql)
+    if not number_match:
+        return None
+    
+    try:
+        num_str = number_match.group(1)
+        if '.' in num_str:
+            num = float(num_str)
+        else:
+            num = int(num_str)
+    except (ValueError, AttributeError):
+        return None
+    
+    # Check for odd/even
+    if re.search(r'\b(?:is|are)\s+\d+(?:\.\d+)?\s+(?:an?\s+)?(?:odd|even)', ql):
+        if isinstance(num, float) and num != int(num):
+            return "Not applicable to decimals.", False
+        num_int = int(num)
+        if re.search(r'\b(?:odd|odd number)', ql):
+            return ("YES" if num_int % 2 != 0 else "NO"), False
+        elif re.search(r'\b(?:even|even number)', ql):
+            return ("YES" if num_int % 2 == 0 else "NO"), False
+    
+    # Check for prime
+    if re.search(r'\b(?:is|are)\s+\d+\s+(?:a\s+)?prime', ql):
+        if isinstance(num, float) and num != int(num):
+            return "Not applicable to decimals.", False
+        num_int = int(num)
+        if num_int < 2:
+            return "NO", False
+        is_prime = _is_prime(num_int)
+        return ("YES" if is_prime else "NO"), False
+    
+    # Check for positive/negative
+    if re.search(r'\b(?:is|are)\s+[+-]?\d+(?:\.\d+)?\s+(?:positive|negative|zero)', ql):
+        if re.search(r'\bpositive', ql):
+            return ("YES" if num > 0 else "NO"), False
+        elif re.search(r'\bnegative', ql):
+            return ("YES" if num < 0 else "NO"), False
+        elif re.search(r'\bzero', ql):
+            return ("YES" if num == 0 else "NO"), False
+    
+    # Check for divisibility
+    divisor_match = re.search(r'(?:divisible|divide)\s+by\s+(\d+)', ql)
+    if divisor_match:
+        try:
+            divisor = int(divisor_match.group(1))
+            if divisor == 0:
+                return "Cannot divide by zero.", False
+            if isinstance(num, float) and num != int(num):
+                return "Not applicable to decimals.", False
+            num_int = int(num)
+            return ("YES" if num_int % divisor == 0 else "NO"), False
+        except (ValueError, ZeroDivisionError):
+            return None
+    
+    return None
+
+
+def try_comparative_entity_question(query: str) -> Optional[Tuple[str, bool]]:
+    """Handle questions like 'Alice scored 80, Bob scored 90. Who scored highest?'"""
+    q = query.strip()
+    ql = q.lower()
+
+    asks_entity = bool(re.search(r"\b(who|which\s+\w+|what\s+\w+)\b", ql))
+    asks_highest = bool(re.search(r"\b(highest|maximum|max|top|most)\b", ql))
+    asks_lowest = bool(re.search(r"\b(lowest|minimum|min|least)\b", ql))
+    if not asks_entity or (not asks_highest and not asks_lowest):
+        return None
+
+    # Capture simple "Name ... number" pairs from the prompt.
+    pairs = []
+    for m in re.finditer(
+        r"\b([A-Za-z][A-Za-z0-9_-]{0,39})\b\s+"
+        r"(?:scored?|score|got|has|had|is|was|=|at)?\s*"
+        r"([+-]?\d+(?:\.\d+)?)",
+        q,
+    ):
+        name = m.group(1)
+        try:
+            value = float(m.group(2))
+        except ValueError:
+            continue
+        pairs.append((name, value, m.start()))
+
+    if len(pairs) < 2:
+        return None
+
+    if asks_highest:
+        best = max(pairs, key=lambda x: (x[1], -x[2]))
+    else:
+        best = min(pairs, key=lambda x: (x[1], x[2]))
+
+    return best[0], True
+
+
+def _is_extraction_query(query: str) -> bool:
+    """Detect if a query is an extraction/processing type (raw output mode)."""
+    ql = query.lower().strip()
+    extraction_patterns = [
         r"^extract\s+", r"^reverse\s+", r"^convert\s+.+\s+to\s+(?:upper|lower|binary|hex|octal|decimal|roman)",
         r"^sort\s+", r"^count\s+", r"^find\s+(?:the\s+)?(?:max|min|largest|smallest|common)",
         r"^remove\s+", r"^replace\s+", r"^concatenate\s+", r"^split\s+",
-        r"^is\s+", r"^does\s+", r"^are\s+", r"^can\s+",
+        r"^trim\s+", r"^strip\s+",
         r"^(?:how\s+many|what(?:'s|\s+is)\s+(?:the\s+)?length)",
+        r"^is\s+.+\s+(?:a\s+)?palindrome",
         r"^(?:first|last)\s+\d+\s+(?:char|letter)",
-        r"^repeat\s+", r"^(?:what|which)\s+day\s+", r"^how\s+many\s+days?\s+",
-        r"^unique\s+", r"word\s+count", r"character\s+count",
+        r"^repeat\s+",
+        r"^(?:what|which)\s+day\s+",
+        r"^how\s+many\s+days?\s+",
+        r"^is\s+\d{4}\s+.*leap",
+        r"^unique\s+",
+        r"word\s+count", r"character\s+count", r"char\s+count",
     ]
-    return any(re.search(p, ql) for p in patterns)
+    for pattern in extraction_patterns:
+        if re.search(pattern, ql):
+            return True
+    return False
 
 
-def generate_answer(query, assets):
+def generate_answer(query: str, assets: list) -> Tuple[str, bool]:
     """
-    Main pipeline. Returns (answer, is_raw).
-    is_raw=True -> no sentence formatting.
+    Main answer pipeline. Returns (answer, is_raw).
+    is_raw=True means output should not have sentence formatting.
 
-    Order:
-    1. Boolean yes/no (raw) -- Level 3
-    2. Text extraction (raw) -- Level 2
-    3. String operations (raw)
-    4. List operations (raw)
-    5. Number base conversion (raw)
-    6. Date operations (raw)
-    7. Arithmetic (sentence) -- Level 1
-    8. Unit conversion (sentence)
-    9. Gemini LLM
-    10. Fallbacks
+    Pipeline:
+    1. Text extraction (raw mode)
+    2. String operations (raw mode)
+    3. List operations (raw mode)
+    4. Number base conversion (raw mode)
+    5. Date operations (raw mode)
+    6. Arithmetic (sentence mode)
+    7. Unit/temp conversion (sentence mode)
+    8. Gemini LLM
+    9. DuckDuckGo → Wikipedia → Extractive fallbacks
     """
     context = _assets_context(assets)
 
-    # 1. Boolean yes/no
-    result = try_boolean_question(query)
-    if result is not None:
-        return result
-
-    # 2. Text extraction
+    # ── Step 1: Text extraction ──
     result = try_text_extraction(query)
     if result is not None:
-        return result
+        return result  # Already a (str, bool) tuple
 
-    # 3. String operations
+    # ── Step 2: String operations ──
     result = try_string_operation(query)
     if result is not None:
         return result
 
-    # 4. List operations
+    # ── Step 3: List operations ──
     result = try_list_operation(query)
     if result is not None:
         return result
 
-    # 5. Number base conversion
+    # ── Step 4: Number base conversion ──
     result = try_number_base_conversion(query)
     if result is not None:
         return result
 
-    # 6. Date operations
+    # ── Step 5: Date operations ──
     result = try_date_operation(query)
     if result is not None:
         return result
 
-    # 7. Arithmetic
-    arith = parse_arithmetic_query(query)
-    if arith is not None:
-        return arith, False
+    # ── Step 5.5: Number property questions ──
+    result = try_number_property_question(query)
+    if result is not None:
+        return result
 
-    # 8. Conversions
-    conv = try_conversion(query)
-    if conv is not None:
-        return conv, False
+    # ── Step 5.6: Comparative entity questions (Level 5) ──
+    result = try_comparative_entity_question(query)
+    if result is not None:
+        return result
 
-    # 9. Gemini
-    is_raw = _is_extraction_query(query)
-    gemini = _call_gemini(query, context)
-    if gemini:
-        return gemini, is_raw
+    # ── Step 6: Arithmetic ──
+    arith_result = parse_arithmetic_query(query)
+    if arith_result is not None:
+        return arith_result, False
 
-    # 10. Fallbacks
-    ddg = _duckduckgo_answer(query)
-    if ddg:
-        return ddg, False
-    wiki = _wikipedia_summary(query)
-    if wiki:
-        return wiki, False
-    ext = _extractive_answer(query, context)
-    if ext:
-        return ext, False
+    # ── Step 7: Conversions ──
+    conv_result = try_conversion(query)
+    if conv_result is not None:
+        return conv_result, False
+
+    # ── Step 8: Gemini LLM ──
+    is_raw_query = _is_extraction_query(query)
+    gemini_result = _call_gemini(query, context)
+    if gemini_result:
+        return gemini_result, is_raw_query
+
+    # ── Step 9: Fallbacks ──
+    ddg_result = _duckduckgo_answer(query)
+    if ddg_result:
+        return ddg_result, False
+
+    wiki_result = _wikipedia_summary(query)
+    if wiki_result:
+        return wiki_result, False
+
+    extractive = _extractive_answer(query, context)
+    if extractive:
+        return extractive, False
 
     return "I cannot determine the answer.", False
 
 
-# ==============================================================================
-# SECTION 13: FLASK ROUTES
-# ==============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 13: REQUEST HANDLING & FLASK ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def validate_payload(payload):
+def validate_payload(payload: object) -> Tuple[bool, Optional[str], Optional[str], Optional[list]]:
     if not isinstance(payload, dict):
         return False, "Request body must be a JSON object.", None, None
     query = payload.get("query")
@@ -1665,11 +2034,16 @@ def validate_payload(payload):
     return True, None, query.strip(), assets
 
 
-def build_output_payload(text):
-    return {"output": text, "answer": text, "result": text, "response": text}
+def build_output_payload(text: str) -> dict[str, str]:
+    return {
+        "output": text,
+        "answer": text,
+        "result": text,
+        "response": text,
+    }
 
 
-def extract_payload():
+def extract_payload() -> Any:
     payload = request.get_json(silent=True)
     if isinstance(payload, dict):
         return payload
@@ -1686,42 +2060,53 @@ def extract_payload():
         assets = []
         if assets_raw:
             try:
-                parsed = json.loads(assets_raw)
-                if isinstance(parsed, list):
-                    assets = parsed
+                parsed_assets = json.loads(assets_raw)
+                if isinstance(parsed_assets, list):
+                    assets = parsed_assets
             except json.JSONDecodeError:
                 assets = [assets_raw]
         if query is not None:
             return {"query": query, "assets": assets}
     query_arg = request.args.get("query")
     if query_arg is not None:
-        return {"query": query_arg, "assets": request.args.getlist("assets")}
+        assets_arg = request.args.getlist("assets")
+        return {"query": query_arg, "assets": assets_arg}
     return payload
 
 
 @app.route("/v1/answer", methods=["POST", "GET"])
 def answer():
-    start = time.time()
+    start_time = time.time()
     payload = extract_payload()
+
     is_valid, err, query, assets = validate_payload(payload)
     if not is_valid:
         print(f"[EVAL-LOG] Invalid Payload: {payload}", flush=True)
         return jsonify({"error": err}), 400
+
     print(f"\n[EVAL-LOG] Query: {query}", flush=True)
     print(f"[EVAL-LOG] Assets: {assets}", flush=True)
+
     raw_output, is_raw = generate_answer(query, assets)
-    final = sanitize_raw_output(raw_output) if is_raw else sanitize_output(raw_output)
-    if not final:
-        final = "I cannot determine the answer."
-    ms = int((time.time() - start) * 1000)
-    print(f"[EVAL-LOG] Output: {final} (raw={is_raw}, {ms}ms)\n", flush=True)
-    return jsonify(build_output_payload(final)), 200
+
+    if is_raw:
+        final_output = sanitize_raw_output(raw_output)
+    else:
+        final_output = sanitize_output(raw_output)
+
+    if not final_output:
+        final_output = "I cannot determine the answer."
+
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    print(f"[EVAL-LOG] Output: {final_output} (raw={is_raw}, {elapsed_ms}ms)\n", flush=True)
+
+    return jsonify(build_output_payload(final_output)), 200
 
 
 @app.route("/health", methods=["GET"])
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "version": "4.0"}), 200
+    return jsonify({"status": "ok", "version": "3.0"}), 200
 
 
 @app.errorhandler(405)
@@ -1735,4 +2120,5 @@ def internal_error(_):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
