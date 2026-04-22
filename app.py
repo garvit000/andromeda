@@ -12,6 +12,11 @@ _ARITH_EXPR_RE = re.compile(
     r"^\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([+\-*/xX])\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*$"
 )
 
+# Search-mode regex to extract arithmetic expressions from noisy text.
+_ARITH_EXPR_SEARCH_RE = re.compile(
+    r"([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([+\-*/xX])\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))"
+)
+
 # Optional natural-language arithmetic patterns.
 _NL_PATTERNS = [
     ("add", re.compile(r"^\s*(?:what is\s+)?([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:plus|add)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*\??\s*$", re.IGNORECASE)),
@@ -49,6 +54,24 @@ def parse_arithmetic_query(query: str) -> Optional[Tuple[str, float, float]]:
         m = pattern.match(query)
         if m:
             return operation, float(m.group(1)), float(m.group(2))
+
+    # Final fast fallback: extract inline expression from otherwise noisy text.
+    match = _ARITH_EXPR_SEARCH_RE.search(query)
+    if match:
+        left = float(match.group(1))
+        op_token = match.group(2)
+        right = float(match.group(3))
+        op_map = {
+            "+": "add",
+            "-": "sub",
+            "*": "mul",
+            "/": "div",
+            "x": "mul",
+            "X": "mul",
+        }
+        operation = op_map.get(op_token)
+        if operation:
+            return operation, left, right
 
     return None
 
