@@ -256,7 +256,7 @@ def llm_style_fallback(query: str, assets: list) -> str:
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
     if api_key:
-        model_env = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest,gemini-pro,gemini-1.0-pro,gemini-1.5-pro-latest,gemini-2.0-flash")
+        model_env = os.getenv("GEMINI_MODEL", "gemini-2.0-flash,gemini-1.5-flash")
         model_candidates = [m.strip() for m in model_env.split(",") if m.strip()]
 
         prompt = (
@@ -286,7 +286,7 @@ def llm_style_fallback(query: str, assets: list) -> str:
         }
 
         for model in model_candidates:
-            for attempt in range(2):
+            for attempt in range(6):
                 endpoint = (
                     "https://generativelanguage.googleapis.com/v1beta/models/"
                     f"{model}:generateContent?key={api_key}"
@@ -306,7 +306,7 @@ def llm_style_fallback(query: str, assets: list) -> str:
                 except urlerror.HTTPError as e:
                     print(f"[EVAL-LOG] Gemini error on {model} (Attempt {attempt}): {repr(e)}", flush=True)
                     if e.code == 429:
-                        time.sleep(1.5)
+                        time.sleep(2.5)
                         continue
                     break # non-429 error, move to next model
                 except Exception as e:
