@@ -17,13 +17,36 @@ _ARITH_EXPR_SEARCH_RE = re.compile(
     r"([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([+\-*/xX])\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))"
 )
 
+_OP_MAP = {
+    "+": "add",
+    "-": "sub",
+    "*": "mul",
+    "/": "div",
+    "x": "mul",
+    "X": "mul",
+}
+
 # Optional natural-language arithmetic patterns.
 _NL_PATTERNS = [
     ("add", re.compile(r"^\s*(?:what is\s+)?([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:plus|add)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*\??\s*$", re.IGNORECASE)),
     ("sub", re.compile(r"^\s*(?:what is\s+)?([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:minus|subtract)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*\??\s*$", re.IGNORECASE)),
     ("mul", re.compile(r"^\s*(?:what is\s+)?([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:times|multiply)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*\??\s*$", re.IGNORECASE)),
     ("div", re.compile(r"^\s*(?:what is\s+)?([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:divided by|divide)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*\??\s*$", re.IGNORECASE)),
+    ("add", re.compile(r"\b(?:sum of|add)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:and|,)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\b", re.IGNORECASE)),
+    ("sub", re.compile(r"\b(?:difference between)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:and|,)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\b", re.IGNORECASE)),
+    ("mul", re.compile(r"\b(?:product of|multiply)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:and|,)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\b", re.IGNORECASE)),
+    ("div", re.compile(r"\b(?:quotient of)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:and|,)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\b", re.IGNORECASE)),
 ]
+
+_SUBTRACT_FROM_RE = re.compile(
+    r"\bsubtract\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*from\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\b",
+    re.IGNORECASE,
+)
+
+_DIVIDE_BY_RE = re.compile(
+    r"\bdivide\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*by\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\b",
+    re.IGNORECASE,
+)
 
 
 def _format_number(value: float) -> str:
@@ -38,20 +61,22 @@ def parse_arithmetic_query(query: str) -> Optional[Tuple[str, float, float]]:
         left = float(match.group(1))
         op_token = match.group(2)
         right = float(match.group(3))
-        op_map = {
-            "+": "add",
-            "-": "sub",
-            "*": "mul",
-            "/": "div",
-            "x": "mul",
-            "X": "mul",
-        }
-        operation = op_map.get(op_token)
+        operation = _OP_MAP.get(op_token)
         if operation:
             return operation, left, right
 
+    m = _SUBTRACT_FROM_RE.search(query)
+    if m:
+        # "subtract 3 from 10" -> 10 - 3
+        return "sub", float(m.group(2)), float(m.group(1))
+
+    m = _DIVIDE_BY_RE.search(query)
+    if m:
+        # "divide 10 by 2" -> 10 / 2
+        return "div", float(m.group(1)), float(m.group(2))
+
     for operation, pattern in _NL_PATTERNS:
-        m = pattern.match(query)
+        m = pattern.search(query)
         if m:
             return operation, float(m.group(1)), float(m.group(2))
 
@@ -61,15 +86,7 @@ def parse_arithmetic_query(query: str) -> Optional[Tuple[str, float, float]]:
         left = float(match.group(1))
         op_token = match.group(2)
         right = float(match.group(3))
-        op_map = {
-            "+": "add",
-            "-": "sub",
-            "*": "mul",
-            "/": "div",
-            "x": "mul",
-            "X": "mul",
-        }
-        operation = op_map.get(op_token)
+        operation = _OP_MAP.get(op_token)
         if operation:
             return operation, left, right
 
@@ -109,8 +126,8 @@ def sanitize_output(text: str) -> str:
     if not cleaned:
         return "I cannot determine the answer."
 
-    # Keep only the first sentence-like segment.
-    split_match = re.search(r"[.!?]", cleaned)
+    # Keep only the first sentence-like segment, but ignore decimal points.
+    split_match = re.search(r"[!?]|\.(?!\d)", cleaned)
     if split_match:
         cleaned = cleaned[: split_match.start() + 1]
 
