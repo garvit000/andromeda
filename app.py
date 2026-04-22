@@ -410,7 +410,23 @@ def answer():
     if not is_valid:
         return jsonify({"error": err}), 400
 
-    raw_output = llm_style_fallback(query, assets)
+    arithmetic = parse_arithmetic_query(query)
+    if arithmetic:
+        operation, left, right = arithmetic
+        raw_output = solve_arithmetic(operation, left, right)
+    else:
+        context = _assets_context(assets)
+        extractive = _extractive_answer(query, context)
+        if extractive:
+            raw_output = extractive
+        else:
+            raw_output = "I cannot determine the answer."
+            if _env_flag("ENABLE_LLM_FALLBACK", False):
+                wiki_answer = _wikipedia_summary(query)
+                if wiki_answer:
+                    raw_output = wiki_answer
+                else:
+                    raw_output = llm_style_fallback(query, assets)
 
     final_output = sanitize_output(raw_output)
     return jsonify(build_output_payload(final_output)), 200
