@@ -1969,14 +1969,13 @@ def try_comparison_query(query):
     q = query.strip()
     ql = q.lower()
 
-    # Must contain a comparison question keyword
-    has_trigger = re.search(
-        r"\b(who|which|what|return|find|give|name|tell|get|identify)\b.+"
-        r"\b(most|least|highest|lowest|best|worst|more|less|greater|smaller|bigger|cheaper|cheapest|"
+    # Check for comparison keywords anywhere in the query
+    if not re.search(
+        r"\b(highest|lowest|most|least|best|worst|more|less|greater|smaller|bigger|cheaper|cheapest|"
         r"expensive|faster|slower|older|younger|taller|shorter|heavier|lighter|"
-        r"maximum|minimum|max|min|scored|total|sum|average|mean|difference|"
-        r"won|winner|lost|loser|first|last|top|bottom|scorer|earner)\b", ql)
-    if not has_trigger:
+        r"maximum|minimum|max|min|total|sum|average|mean|difference|"
+        r"won|winner|lost|loser|top|bottom|scorer|earner|"
+        r"who\s+scored|who\s+has|who\s+had|who\s+got|who\s+earned|who\s+is|who\s+was)\b", ql):
         return None
 
     # Split query into data part and question part
