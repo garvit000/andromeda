@@ -252,19 +252,25 @@ def _wikipedia_summary(query: str) -> str:
 
 def llm_style_fallback(query: str, assets: list) -> str:
     context = _assets_context(assets)
-    extractive = _extractive_answer(query, context)
-    if extractive:
-        return extractive
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
     if api_key:
-        model_env = os.getenv("GEMINI_MODEL", "gemini-1.5-flash,gemini-1.5-flash-8b,gemini-2.0-flash")
+        model_env = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-thinking-exp,gemini-2.0-flash,gemini-1.5-pro,gemini-1.5-flash")
         model_candidates = [m.strip() for m in model_env.split(",") if m.strip()]
 
         prompt = (
-            "Answer the query in exactly one concise sentence ending with a period. "
-            "If context is present, prioritize it. "
-            "Do not add prefixes, labels, or multiple sentences. "
+            "You are a strict API answering engine. Follow these rules EXACTLY:\n"
+            "1. Focus purely on answering the query.\n"
+            "2. If it is basic arithmetic:\n"
+            "   - Addition -> 'The sum is X.'\n"
+            "   - Subtraction -> 'The difference is X.'\n"
+            "   - Multiplication -> 'The product is X.'\n"
+            "   - Division -> 'The quotient is X.'\n"
+            "   (Format X as a plain number).\n"
+            "3. Base non-arithmetic answers ONLY on the provided Context if present.\n"
+            "4. YOUR OUTPUT MUST BE EXACTLY ONE CONCISE SENTENCE.\n"
+            "5. YOUR OUTPUT MUST END WITH A PERIOD '.'\n"
+            "6. Provide NO explanations, NO introductory text, and NO reasoning steps.\n\n"
             f"Query: {query}\n"
             f"Context: {context if context else 'None'}"
         )
@@ -274,7 +280,7 @@ def llm_style_fallback(query: str, assets: list) -> str:
             "generationConfig": {
                 "temperature": 0,
                 "topP": 0.1,
-                "maxOutputTokens": 80,
+                "maxOutputTokens": 100,
             },
         }
 
@@ -290,17 +296,15 @@ def llm_style_fallback(query: str, assets: list) -> str:
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with urlrequest.urlopen(req, timeout=4.0) as resp:
+                with urlrequest.urlopen(req, timeout=10.0) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 candidate_text = data["candidates"][0]["content"]["parts"][0]["text"]
                 if isinstance(candidate_text, str) and candidate_text.strip():
-                    return candidate_text
+                    # If using a thinking model, it might still return reasoning if not strictly disabled,
+                    # but simple text parts should be just the string.
+                    return candidate_text.strip()
             except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError, KeyError, IndexError, TypeError):
                 continue
-
-    wiki = _wikipedia_summary(query)
-    if wiki:
-        return wiki
 
     return "I cannot determine the answer."
 
@@ -352,12 +356,14 @@ def validate_payload(payload: object) -> Tuple[bool, Optional[str], Optional[str
 
 
 def build_output_payload(text: str) -> dict[str, str]:
-    return {
-        "output": text,
-        "result": text,
-        "answer": text,
-        "response": text,
-    }
+    if _env_flag("RETURN_ALL_KEYS", False):
+        return {
+            "output": text,
+            "result": text,
+            "answer": text,
+            "response": text,
+        }
+    return {"output": text}
 
 
 def extract_payload() -> Any:
@@ -404,22 +410,7 @@ def answer():
     if not is_valid:
         return jsonify({"error": err}), 400
 
-    parsed = parse_arithmetic_query(query)
-    force_gemini_all = _env_flag("GEMINI_FORCE_ALL", True)
-
-    if force_gemini_all:
-        # Temporary mode: attempt Gemini-agent path for all prompts first.
-        raw_output = llm_style_fallback(query, assets)
-        # Preserve exact arithmetic scoring behavior.
-        if parsed is not None:
-            operation, left, right = parsed
-            raw_output = solve_arithmetic(operation, left, right)
-    else:
-        if parsed is not None:
-            operation, left, right = parsed
-            raw_output = solve_arithmetic(operation, left, right)
-        else:
-            raw_output = llm_style_fallback(query, assets)
+    raw_output = llm_style_fallback(query, assets)
 
     final_output = sanitize_output(raw_output)
     return jsonify(build_output_payload(final_output)), 200
