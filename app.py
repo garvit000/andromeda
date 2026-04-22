@@ -55,6 +55,13 @@ _DIVIDE_BY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_BROAD_NL_PATTERNS = [
+    ("add", re.compile(r"([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:plus|added to)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))", re.IGNORECASE)),
+    ("sub", re.compile(r"([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:minus|subtracted from)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))", re.IGNORECASE)),
+    ("mul", re.compile(r"([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:times|multiplied by)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))", re.IGNORECASE)),
+    ("div", re.compile(r"([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:divided by)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))", re.IGNORECASE)),
+]
+
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -96,6 +103,13 @@ def parse_arithmetic_query(query: str) -> Optional[Tuple[str, float, float]]:
     for operation, pattern in _NL_PATTERNS:
         m = pattern.search(query)
         if m:
+            return operation, float(m.group(1)), float(m.group(2))
+
+    for operation, pattern in _BROAD_NL_PATTERNS:
+        m = pattern.search(query)
+        if m:
+            if operation == "sub" and "subtracted from" in m.group(0).lower():
+                return operation, float(m.group(2)), float(m.group(1))
             return operation, float(m.group(1)), float(m.group(2))
 
     # Final fast fallback: extract inline expression from otherwise noisy text.
@@ -254,6 +268,12 @@ def _wikipedia_summary(query: str) -> str:
 def llm_style_fallback(query: str, assets: list) -> str:
     context = _assets_context(assets)
 
+    # Fast-path local logic to save Gemini rate limits for complex questions
+    parsed = parse_arithmetic_query(query)
+    if parsed is not None:
+        operation, left, right = parsed
+        return solve_arithmetic(operation, left, right)
+
     api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
     if api_key:
         model_env = os.getenv("GEMINI_MODEL", "gemini-2.0-flash,gemini-1.5-flash")
@@ -314,12 +334,6 @@ def llm_style_fallback(query: str, assets: list) -> str:
                     break
     else:
         print("[EVAL-LOG] No Gemini API key found!", flush=True)
-
-    # Fallback to local logic if LLM fails or is missing key.
-    parsed = parse_arithmetic_query(query)
-    if parsed is not None:
-        operation, left, right = parsed
-        return solve_arithmetic(operation, left, right)
 
     extractive = _extractive_answer(query, context)
     if extractive:
