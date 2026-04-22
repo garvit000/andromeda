@@ -1931,36 +1931,58 @@ def try_boolean_question(query):
 # ==============================================================================
 
 def _extract_entity_values(text):
-    """Extract (name, value) pairs from text like 'Alice scored 80, Bob scored 90'."""
+    """Extract (name, value) pairs from text."""
     pairs = []
-    # Pattern: "Name verb Number" (Alice scored 80, Bob has 3, Tom earned $500)
+    stopwords = {"who", "what", "which", "the", "a", "an", "it", "he", "she", "they",
+                 "and", "or", "but", "is", "are", "was", "were", "has", "have", "had",
+                 "do", "does", "did", "will", "would", "can", "could", "should",
+                 "return", "find", "give", "name", "tell", "get", "identify",
+                 "how", "many", "much", "by", "if", "then", "that", "this",
+                 "first", "second", "third", "last", "next", "each", "every",
+                 "total", "sum", "average", "mean", "difference", "highest",
+                 "lowest", "most", "least", "best", "worst", "more", "less",
+                 "did", "does", "scorer", "winner", "loser"}
+
+    verbs = (r"(?:scored|scores?|has|have|had|got|gets|earned|earns|received|receives|"
+             r"made|makes|weighs?|costs?|is|was|are|were|runs?|ran|finished|"
+             r"took|takes|spent|spends|pays?|paid|sold|sells|ate|eats|"
+             r"owns?|holds?|carries|carried|collected|saves?|saved|"
+             r"hit|hits|threw|throws|caught|catches|answered|completed|"
+             r"drank|drinks|read|reads|wrote|writes|walked|walks|drove|drives)")
+
+    # Pattern 1: "Name verb Number"
     for m in re.finditer(
-        r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s+"
-        r"(?:scored|score|has|have|had|got|gets|earned|earns|received|receives|made|makes|"
-        r"weighs|weigh|costs?|is|was|are|were|runs?|ran|finished|took|takes|spent|pays?|paid)\s+"
-        r"\$?([+-]?\d+(?:\.\d+)?)",
+        r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s+" + verbs + r"\s+\$?([+-]?\d+(?:\.\d+)?)",
         text,
     ):
-        pairs.append((m.group(1).strip(), float(m.group(2))))
+        name = m.group(1).strip()
+        if name.lower() not in stopwords:
+            pairs.append((name, float(m.group(2))))
     if pairs:
         return pairs
 
-    # Pattern: "Name: Number" or "Name - Number"
-    for m in re.finditer(r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s*[:\-]\s*\$?(\d+(?:\.\d+)?)", text):
-        pairs.append((m.group(1).strip(), float(m.group(2))))
+    # Pattern 2: "Name: Number" or "Name - Number" or "Name = Number"
+    for m in re.finditer(r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s*[:\-=]\s*\$?(\d+(?:\.\d+)?)", text):
+        name = m.group(1).strip()
+        if name.lower() not in stopwords:
+            pairs.append((name, float(m.group(2))))
     if pairs:
         return pairs
 
-    # Pattern: lowercase names: "alice scored 80"
+    # Pattern 3: case-insensitive "name verb number"
     for m in re.finditer(
-        r"([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+"
-        r"(?:scored|has|had|got|earned|received|made|weighs|costs?|is|was)\s+"
-        r"\$?(\d+(?:\.\d+)?)",
+        r"([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+" + verbs + r"\s+\$?(\d+(?:\.\d+)?)",
         text, re.IGNORECASE,
     ):
         name = m.group(1).strip()
-        if name.lower() not in {"who", "what", "which", "the", "a", "an", "it", "he", "she", "they", "and", "or", "but"}:
+        if name.lower() not in stopwords and len(name) > 1:
             pairs.append((name, float(m.group(2))))
+    if pairs:
+        return pairs
+
+    # Pattern 4: "Name (Number)" or "Name [Number]"
+    for m in re.finditer(r"([A-Z][a-zA-Z]+)\s*[\(\[]\s*(\d+(?:\.\d+)?)\s*[\)\]]", text):
+        pairs.append((m.group(1).strip(), float(m.group(2))))
     return pairs
 
 
@@ -1969,61 +1991,152 @@ def try_comparison_query(query):
     q = query.strip()
     ql = q.lower()
 
-    # Check for comparison keywords anywhere in the query
-    if not re.search(
-        r"\b(highest|lowest|most|least|best|worst|more|less|greater|smaller|bigger|cheaper|cheapest|"
-        r"expensive|faster|slower|older|younger|taller|shorter|heavier|lighter|"
-        r"maximum|minimum|max|min|total|sum|average|mean|difference|"
-        r"won|winner|lost|loser|top|bottom|scorer|earner|"
-        r"who\s+scored|who\s+has|who\s+had|who\s+got|who\s+earned|who\s+is|who\s+was)\b", ql):
-        return None
-
-    # Split query into data part and question part
-    # Usually separated by period or question mark
-    parts = [p.strip() for p in re.split(r'[.?]\s*', q) if p.strip()]
-    data_part = parts[0] if parts else q
-    question_part = parts[-1].lower().strip() if len(parts) > 1 else ql
-
-    # Use full query text for entity extraction
+    # Extract entities first - if we have entities, try to answer
     entities = _extract_entity_values(q)
+
+    # Handle single entity lookup
+    if len(entities) == 1:
+        m = re.search(r"what\s+(?:did|does|is|was)\s+(\w+)\s+(?:score|get|earn|have|make|cost|weigh)", ql)
+        if m:
+            target = m.group(1).lower()
+            for name, val in entities:
+                if name.lower() == target:
+                    return _format_number(val), True
+
     if len(entities) < 2:
         return None
 
-    # Determine question type - search both question_part and full query
-    qcheck = question_part + " " + ql
+    # Build helpers
+    entity_dict = {name.lower(): (name, val) for name, val in entities}
+    sorted_desc = sorted(entities, key=lambda x: x[1], reverse=True)
+    sorted_asc = sorted(entities, key=lambda x: x[1])
 
-    # MAX: highest, most, best, greater, bigger, more, top, won, winner, older, taller, heavier, faster, expensive
-    if re.search(r"\b(highest|most|best|greater|bigger|more|top|won|winner|older|taller|heavier|faster|expensive|maximum|max)\b", qcheck):
-        # "first" modifier means first mentioned among top scorers
+    # ── RANKING: second/third/nth highest/lowest ──
+    ordinals = {"second": 2, "third": 3, "fourth": 4, "fifth": 5,
+                "2nd": 2, "3rd": 3, "4th": 4, "5th": 5}
+    m = re.search(r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th)\s+(highest|lowest|best|worst|most|least|top|bottom|largest|smallest)", ql)
+    if m:
+        idx = ordinals.get(m.group(1), 2) - 1
+        if m.group(2) in ("lowest", "worst", "least", "bottom", "smallest"):
+            if idx < len(sorted_asc):
+                return sorted_asc[idx][0], True
+        else:
+            if idx < len(sorted_desc):
+                return sorted_desc[idx][0], True
+
+    # ── RANK/SORT/ORDER ──
+    if re.search(r"\b(rank|sort|order|arrange|list)\b", ql):
+        if re.search(r"\b(ascending|low.to.high|smallest.first|increasing)\b", ql):
+            return ", ".join(n for n, v in sorted_asc), True
+        return ", ".join(n for n, v in sorted_desc), True
+
+    # ── LOOKUP: what did X score? ──
+    m = re.search(r"what\s+(?:did|does|is|was)\s+(\w+)'?s?\s+(?:score|total|mark|point|value|earning|cost|weight|age)", ql)
+    if not m:
+        m = re.search(r"what\s+(?:did|does)\s+(\w+)\s+(?:score|get|earn|have|make|cost|weigh)", ql)
+    if not m:
+        m = re.search(r"(\w+)'s\s+(?:score|total|mark|point|value)", ql)
+    if m:
+        target = m.group(1).lower()
+        for name, val in entities:
+            if name.lower() == target:
+                return _format_number(val), True
+
+    # ── YES/NO: did X score more than Y? ──
+    m = re.search(r"did\s+(\w+)\s+(?:score|earn|get|make|have)\s+(?:more|higher|greater|better)\s+than\s+(\w+)", ql)
+    if not m:
+        m = re.search(r"did\s+(\w+)\s+(?:beat|outperform|outscore|defeat)\s+(\w+)", ql)
+    if m:
+        v1 = entity_dict.get(m.group(1).lower(), (None, None))[1]
+        v2 = entity_dict.get(m.group(2).lower(), (None, None))[1]
+        if v1 is not None and v2 is not None:
+            return ("YES" if v1 > v2 else "NO"), True
+
+    m = re.search(r"did\s+(\w+)\s+(?:score|earn|get)\s+(?:less|lower|fewer)\s+than\s+(\w+)", ql)
+    if m:
+        v1 = entity_dict.get(m.group(1).lower(), (None, None))[1]
+        v2 = entity_dict.get(m.group(2).lower(), (None, None))[1]
+        if v1 is not None and v2 is not None:
+            return ("YES" if v1 < v2 else "NO"), True
+
+    # ── BY HOW MUCH ──
+    m = re.search(r"(?:by\s+)?how\s+much\s+(?:did\s+)?(\w+)\s+(?:beat|outscore|lead|outperform|score\s+more)", ql)
+    if not m:
+        m = re.search(r"difference\s+between\s+(\w+)(?:'s?)?\s+and\s+(\w+)", ql)
+    if m:
+        n1 = m.group(1).lower()
+        n2 = m.group(2).lower() if m.lastindex >= 2 else None
+        v1 = entity_dict.get(n1, (None, None))[1]
+        if n2:
+            v2 = entity_dict.get(n2, (None, None))[1]
+        else:
+            vals = [v for nm, v in entities if nm.lower() != n1]
+            v2 = vals[0] if vals else None
+        if v1 is not None and v2 is not None:
+            return _format_number(abs(v1 - v2)), True
+
+    # ── PASS/FAIL with threshold ──
+    m = re.search(r"who\s+(?:passed|cleared|qualified)(?:\s+(?:with|above|over|scoring\s+above|scoring\s+over)\s+(\d+))?", ql)
+    if m:
+        threshold = float(m.group(1)) if m.group(1) else 50.0
+        passed = [name for name, val in entities if val >= threshold]
+        if passed:
+            return ", ".join(passed), True
+
+    m = re.search(r"who\s+(?:failed|did\s+not\s+pass)(?:\s+(?:below|under|scoring\s+below)\s+(\d+))?", ql)
+    if m:
+        threshold = float(m.group(1)) if m.group(1) else 50.0
+        failed = [name for name, val in entities if val < threshold]
+        if failed:
+            return ", ".join(failed), True
+
+    # ── COUNT ABOVE/BELOW ──
+    m = re.search(r"how\s+many\s+(?:\w+\s+)?(?:scored|got|earned|have)\s+(?:above|over|more\s+than|greater\s+than)\s+(\d+)", ql)
+    if m:
+        return str(sum(1 for _, v in entities if v > float(m.group(1)))), True
+
+    m = re.search(r"how\s+many\s+(?:\w+\s+)?(?:scored|got|earned|have)\s+(?:below|under|less\s+than)\s+(\d+)", ql)
+    if m:
+        return str(sum(1 for _, v in entities if v < float(m.group(1)))), True
+
+    # ── Generic keywords (catch-all) ──
+    # MAX
+    if re.search(r"\b(highest|most|best|greater|bigger|more|top|won|winner|older|taller|heavier|faster|expensive|maximum|max)\b", ql):
         best_val = max(v for _, v in entities)
-        # Return first entity with that value (stable: preserves mention order)
         for name, val in entities:
             if val == best_val:
                 return name, True
 
-    # MIN: lowest, least, worst, smaller, less, fewer, bottom, lost, loser, younger, shorter, lighter, slower, cheaper, minimum
-    if re.search(r"\b(lowest|least|worst|smaller|less|fewer|bottom|lost|loser|younger|shorter|lighter|slower|cheaper|cheapest|minimum|min)\b", qcheck):
+    # MIN
+    if re.search(r"\b(lowest|least|worst|smaller|less|fewer|bottom|lost|loser|younger|shorter|lighter|slower|cheaper|cheapest|minimum|min)\b", ql):
         worst_val = min(v for _, v in entities)
         for name, val in entities:
             if val == worst_val:
                 return name, True
 
     # TOTAL/SUM
-    if re.search(r"\b(total|sum|combined|altogether)\b", qcheck):
+    if re.search(r"\b(total|sum|combined|altogether|overall)\b", ql):
         return _format_number(sum(v for _, v in entities)), True
 
     # AVERAGE/MEAN
-    if re.search(r"\b(average|mean|avg)\b", qcheck):
+    if re.search(r"\b(average|mean|avg)\b", ql):
         return _format_number(sum(v for _, v in entities) / len(entities)), True
 
     # DIFFERENCE
-    if re.search(r"\b(difference|gap|margin)\b", qcheck):
+    if re.search(r"\b(difference|gap|margin|spread|range)\b", ql):
         vals = [v for _, v in entities]
         return _format_number(abs(max(vals) - min(vals))), True
 
     # COUNT
-    if re.search(r"\bhow\s+many\b", qcheck):
+    if re.search(r"\bhow\s+many\b", ql):
         return str(len(entities)), True
+
+    # SCORER/EARNER fallback → treat as MAX
+    if re.search(r"\b(scorer|earner|performer|achiever)\b", ql):
+        best_val = max(v for _, v in entities)
+        for name, val in entities:
+            if val == best_val:
+                return name, True
 
     return None
 
