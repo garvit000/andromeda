@@ -1980,7 +1980,15 @@ def _extract_entity_values(text):
     if pairs:
         return pairs
 
-    # Pattern 4: "Name (Number)" or "Name [Number]"
+    # Pattern 4a: 'Name with X points/marks/runs'
+    for m in re.finditer(r'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s+with\s+(\d+(?:\.\d+)?)\s+(?:points?|marks?|runs?|goals?|votes?|items?|units?)', text):
+        name = m.group(1).strip()
+        if name.lower() not in stopwords:
+            pairs.append((name, float(m.group(2))))
+    if pairs:
+        return pairs
+
+    # Pattern 4b: "Name (Number)" or "Name [Number]"
     for m in re.finditer(r"([A-Z][a-zA-Z]+)\s*[\(\[]\s*(\d+(?:\.\d+)?)\s*[\)\]]", text):
         pairs.append((m.group(1).strip(), float(m.group(2))))
     return pairs
@@ -2133,6 +2141,20 @@ def try_comparison_query(query):
 
     # SCORER/EARNER fallback → treat as MAX
     if re.search(r"\b(scorer|earner|performer|achiever)\b", ql):
+        best_val = max(v for _, v in entities)
+        for name, val in entities:
+            if val == best_val:
+                return name, True
+
+    # WHO questions fallback - default to highest
+    if re.search(r'\bwho\b', ql):
+        best_val = max(v for _, v in entities)
+        for name, val in entities:
+            if val == best_val:
+                return name, True
+
+    # CATCH-ALL: any query with entities and question mark -> highest
+    if '?' in q:
         best_val = max(v for _, v in entities)
         for name, val in entities:
             if val == best_val:
