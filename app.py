@@ -1821,6 +1821,14 @@ def _is_fibonacci(n):
     if n < 0: return False
     return _is_perfect_square(5*n*n+4) or _is_perfect_square(5*n*n-4)
 
+
+def _is_perfect_cube(n):
+    if n < 0:
+        r = round(abs(n) ** (1 / 3))
+        return -(r ** 3) == n
+    r = round(n ** (1 / 3))
+    return r ** 3 == n
+
 def try_boolean_question(query):
     """Handle yes/no questions. Returns ('YES'/'NO', True) or None."""
     ql = query.lower().strip().rstrip("?. ")
@@ -1861,6 +1869,10 @@ def try_boolean_question(query):
     m = re.search(r"is\s+([+-]?\d+)\s+(?:a\s+)?perfect\s+square", ql)
     if m:
         return ("YES" if _is_perfect_square(int(m.group(1))) else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+)\s+(?:a\s+)?perfect\s+cube", ql)
+    if m:
+        return ("YES" if _is_perfect_cube(int(m.group(1))) else "NO", True)
 
     m = re.search(r"is\s+([+-]?\d+)\s+(?:a\s+)?fibonacci(?:\s+number)?", ql)
     if m:
@@ -1950,41 +1962,59 @@ def _extract_entity_values(text):
              r"hit|hits|threw|throws|caught|catches|answered|completed|"
              r"drank|drinks|read|reads|wrote|writes|walked|walks|drove|drives)")
 
+    # Allow labels such as "A", "Q1", "Team A", "Product 2".
+    name_pat = r"([A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z0-9][A-Za-z0-9]*){0,3})"
+    value_pat = r"([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
+
+    def _to_float(num_text):
+        return float(num_text.replace(",", ""))
+
+    def _normalize_name(name_text):
+        name_text = re.sub(r"^(?:and|or|but)\s+", "", name_text.strip(), flags=re.IGNORECASE)
+        return _collapse_whitespace(name_text)
+
+    def _is_valid_name(name_text):
+        low = name_text.lower()
+        if len(name_text) == 1 and name_text.isalpha() and name_text.isupper():
+            return True
+        return low not in stopwords
+
     # Pattern 1: "Name verb Number"
     for m in re.finditer(
-        r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s+" + verbs + r"\s+\$?([+-]?\d+(?:\.\d+)?)",
+        name_pat + r"\s+" + verbs + r"\s+\$?" + value_pat,
         text,
+        re.IGNORECASE,
     ):
-        name = m.group(1).strip()
-        if name.lower() not in stopwords:
-            pairs.append((name, float(m.group(2))))
+        name = _normalize_name(m.group(1))
+        if _is_valid_name(name):
+            pairs.append((name, _to_float(m.group(2))))
     if pairs:
         return pairs
 
     # Pattern 2: "Name: Number" or "Name - Number" or "Name = Number"
-    for m in re.finditer(r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s*[:\-=]\s*\$?(\d+(?:\.\d+)?)", text):
-        name = m.group(1).strip()
-        if name.lower() not in stopwords:
-            pairs.append((name, float(m.group(2))))
+    for m in re.finditer(name_pat + r"\s*[:=\-]\s*\$?" + value_pat, text, re.IGNORECASE):
+        name = _normalize_name(m.group(1))
+        if _is_valid_name(name):
+            pairs.append((name, _to_float(m.group(2))))
     if pairs:
         return pairs
 
     # Pattern 3: case-insensitive "name verb number"
     for m in re.finditer(
-        r"([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+" + verbs + r"\s+\$?(\d+(?:\.\d+)?)",
+        name_pat + r"\s+" + verbs + r"\s+\$?" + value_pat,
         text, re.IGNORECASE,
     ):
-        name = m.group(1).strip()
-        if name.lower() not in stopwords and len(name) > 1:
-            pairs.append((name, float(m.group(2))))
+        name = _normalize_name(m.group(1))
+        if _is_valid_name(name):
+            pairs.append((name, _to_float(m.group(2))))
     if pairs:
         return pairs
 
     # Pattern 4a: 'Name with X points/marks/runs'
-    for m in re.finditer(r'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s+with\s+(\d+(?:\.\d+)?)\s+(?:points?|marks?|runs?|goals?|votes?|items?|units?)', text):
-        name = m.group(1).strip()
-        if name.lower() not in stopwords:
-            pairs.append((name, float(m.group(2))))
+    for m in re.finditer(name_pat + r'\s+with\s+' + value_pat + r'\s+(?:points?|marks?|runs?|goals?|votes?|items?|units?)', text, re.IGNORECASE):
+        name = _normalize_name(m.group(1))
+        if _is_valid_name(name):
+            pairs.append((name, _to_float(m.group(2))))
     if pairs:
         return pairs
 
@@ -2031,6 +2061,17 @@ def try_comparison_query(query):
         else:
             if idx < len(sorted_desc):
                 return sorted_desc[idx][0], True
+
+    # Place-position phrasing: "who came second", "2nd place", "first/last place"
+    m = re.search(r"\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th|last)\b(?:\s+(?:place|position|rank))?", ql)
+    if m:
+        token = m.group(1)
+        if token == "last":
+            return sorted_asc[0][0], True
+        idx = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2,
+               "fourth": 3, "4th": 3, "fifth": 4, "5th": 4}.get(token)
+        if idx is not None and idx < len(sorted_desc):
+            return sorted_desc[idx][0], True
 
     # ── RANK/SORT/ORDER ──
     if re.search(r"\b(rank|sort|order|arrange|list)\b", ql):
