@@ -30,9 +30,9 @@ app = Flask(__name__)
 # SECTION 1: CONFIGURATION & CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_GEMINI_TIMEOUT = 15.0
-_GEMINI_MAX_RETRIES = 5
-_GEMINI_BACKOFF_BASE = 2.0
+_GEMINI_TIMEOUT = 8.0
+_GEMINI_MAX_RETRIES = 2
+_GEMINI_BACKOFF_BASE = 1.0
 _WEB_TIMEOUT = 3.0
 _MAX_ASSET_BYTES = 32000
 _MAX_CONTEXT_CHARS = 16000
@@ -1970,7 +1970,13 @@ def try_comparison_query(query):
     ql = q.lower()
 
     # Must contain a comparison question keyword
-    if not re.search(r"\b(who|which|what)\b.+\b(most|least|highest|lowest|best|worst|more|less|greater|smaller|bigger|cheaper|expensive|faster|slower|older|younger|taller|shorter|heavier|lighter|maximum|minimum|max|min|scored|total|sum|average|mean|difference|won|winner|lost|loser|first|last|top|bottom)\b", ql):
+    has_trigger = re.search(
+        r"\b(who|which|what|return|find|give|name|tell|get|identify)\b.+"
+        r"\b(most|least|highest|lowest|best|worst|more|less|greater|smaller|bigger|cheaper|cheapest|"
+        r"expensive|faster|slower|older|younger|taller|shorter|heavier|lighter|"
+        r"maximum|minimum|max|min|scored|total|sum|average|mean|difference|"
+        r"won|winner|lost|loser|first|last|top|bottom|scorer|earner)\b", ql)
+    if not has_trigger:
         return None
 
     # Split query into data part and question part
@@ -1984,32 +1990,40 @@ def try_comparison_query(query):
     if len(entities) < 2:
         return None
 
-    # Determine question type
+    # Determine question type - search both question_part and full query
+    qcheck = question_part + " " + ql
+
     # MAX: highest, most, best, greater, bigger, more, top, won, winner, older, taller, heavier, faster, expensive
-    if re.search(r"\b(highest|most|best|greater|bigger|more|top|won|winner|older|taller|heavier|faster|expensive|maximum|max)\b", question_part):
-        winner = max(entities, key=lambda x: x[1])
-        return winner[0], True
+    if re.search(r"\b(highest|most|best|greater|bigger|more|top|won|winner|older|taller|heavier|faster|expensive|maximum|max)\b", qcheck):
+        # "first" modifier means first mentioned among top scorers
+        best_val = max(v for _, v in entities)
+        # Return first entity with that value (stable: preserves mention order)
+        for name, val in entities:
+            if val == best_val:
+                return name, True
 
     # MIN: lowest, least, worst, smaller, less, fewer, bottom, lost, loser, younger, shorter, lighter, slower, cheaper, minimum
-    if re.search(r"\b(lowest|least|worst|smaller|less|fewer|bottom|lost|loser|younger|shorter|lighter|slower|cheaper|cheapest|minimum|min)\b", question_part):
-        loser = min(entities, key=lambda x: x[1])
-        return loser[0], True
+    if re.search(r"\b(lowest|least|worst|smaller|less|fewer|bottom|lost|loser|younger|shorter|lighter|slower|cheaper|cheapest|minimum|min)\b", qcheck):
+        worst_val = min(v for _, v in entities)
+        for name, val in entities:
+            if val == worst_val:
+                return name, True
 
     # TOTAL/SUM
-    if re.search(r"\b(total|sum|combined|altogether)\b", question_part):
+    if re.search(r"\b(total|sum|combined|altogether)\b", qcheck):
         return _format_number(sum(v for _, v in entities)), True
 
     # AVERAGE/MEAN
-    if re.search(r"\b(average|mean|avg)\b", question_part):
+    if re.search(r"\b(average|mean|avg)\b", qcheck):
         return _format_number(sum(v for _, v in entities) / len(entities)), True
 
     # DIFFERENCE
-    if re.search(r"\b(difference|gap|margin)\b", question_part):
+    if re.search(r"\b(difference|gap|margin)\b", qcheck):
         vals = [v for _, v in entities]
         return _format_number(abs(max(vals) - min(vals))), True
 
     # COUNT
-    if re.search(r"\bhow\s+many\b", question_part):
+    if re.search(r"\bhow\s+many\b", qcheck):
         return str(len(entities)), True
 
     return None
