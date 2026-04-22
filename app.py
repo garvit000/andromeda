@@ -296,15 +296,30 @@ def llm_style_fallback(query: str, assets: list) -> str:
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with urlrequest.urlopen(req, timeout=10.0) as resp:
+                with urlrequest.urlopen(req, timeout=12.0) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 candidate_text = data["candidates"][0]["content"]["parts"][0]["text"]
                 if isinstance(candidate_text, str) and candidate_text.strip():
-                    # If using a thinking model, it might still return reasoning if not strictly disabled,
-                    # but simple text parts should be just the string.
                     return candidate_text.strip()
-            except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError, KeyError, IndexError, TypeError):
+            except Exception as e:
+                print(f"[EVAL-LOG] Gemini error on {model}: {repr(e)}", flush=True)
                 continue
+    else:
+        print("[EVAL-LOG] No Gemini API key found!", flush=True)
+
+    # Fallback to local logic if LLM fails or is missing key.
+    parsed = parse_arithmetic_query(query)
+    if parsed is not None:
+        operation, left, right = parsed
+        return solve_arithmetic(operation, left, right)
+
+    extractive = _extractive_answer(query, context)
+    if extractive:
+        return extractive
+
+    wiki = _wikipedia_summary(query)
+    if wiki:
+        return wiki
 
     return "I cannot determine the answer."
 
@@ -408,11 +423,18 @@ def answer():
     is_valid, err, query, assets = validate_payload(payload)
 
     if not is_valid:
+        print(f"[EVAL-LOG] Invalid Payload: {payload}", flush=True)
         return jsonify({"error": err}), 400
+
+    print(f"\n[EVAL-LOG] Query: {query}", flush=True)
+    print(f"[EVAL-LOG] Assets: {assets}", flush=True)
 
     raw_output = llm_style_fallback(query, assets)
 
     final_output = sanitize_output(raw_output)
+    
+    print(f"[EVAL-LOG] Output: {final_output}\n", flush=True)
+    
     return jsonify(build_output_payload(final_output)), 200
 
 
