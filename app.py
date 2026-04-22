@@ -1,9 +1,8 @@
-# ═══════════════════════════════════════════════════════════════════════════════
-# ANDROMEDA EVALUATION ENGINE v3.0
-# Comprehensive Q&A + Text Processing engine for hackathon evaluation.
-# Handles: arithmetic, conversions, text extraction, string ops, list ops, LLM.
-# Single-file Flask application – no extra pip deps beyond Flask/gunicorn.
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# ANDROMEDA EVALUATION ENGINE v5.0
+# All-levels: arithmetic, extraction, boolean, comparison/reasoning, LLM.
+# Single-file Flask application - no extra pip deps beyond Flask/gunicorn.
+# ==============================================================================
 from __future__ import annotations
 
 import ast
@@ -413,22 +412,21 @@ def parse_arithmetic_query(query: str) -> Optional[str]:
         result = math.log(val)
         return f"The natural logarithm of {_format_number(val)} is {_format_number(result)}."
 
+    # Prime/even/odd now handled by try_boolean_question (returns YES/NO)
+    # Keeping them here as fallback with YES/NO format
     m = _IS_PRIME_RE.search(q)
     if m:
         val = int(float(m.group(1)))
-        if _is_prime(val):
-            return f"Yes, {val} is a prime number."
-        else:
-            return f"No, {val} is not a prime number."
+        return ("YES" if _is_prime(val) else "NO")
 
     m = _IS_EVEN_ODD_RE.search(q)
     if m:
         val = int(float(m.group(1)))
         check = m.group(2).lower()
         if check == "even":
-            return f"Yes, {val} is an even number." if val % 2 == 0 else f"No, {val} is not an even number."
+            return "YES" if val % 2 == 0 else "NO"
         else:
-            return f"Yes, {val} is an odd number." if val % 2 != 0 else f"No, {val} is not an odd number."
+            return "YES" if val % 2 != 0 else "NO"
 
     m = _SUBTRACT_FROM_RE.search(q)
     if m:
@@ -1589,7 +1587,22 @@ Q: Who wrote Romeo and Juliet?
 A: Romeo and Juliet was written by William Shakespeare.
 
 Q: Is "racecar" a palindrome?
-A: Yes
+A: YES
+
+Q: Is 9 an odd number?
+A: YES
+
+Q: Is 7 a prime number?
+A: YES
+
+Q: Is 10 divisible by 3?
+A: NO
+
+Q: Is 2024 a leap year?
+A: YES
+
+Q: Is 16 a perfect square?
+A: YES
 
 Q: What day of the week was January 1, 2024?
 A: Monday
@@ -1606,11 +1619,20 @@ A: 5
 Q: Remove vowels from "beautiful".
 A: btfl
 
-Q: Extract all numbers from "I have 3 cats and 5 dogs".
-A: 3, 5
-
 Q: Replace "a" with "o" in "banana".
 A: bonono
+
+Q: Alice scored 80, Bob scored 90. Who scored highest?
+A: Bob
+
+Q: Tom earned $500, Jane earned $700. Who earned less?
+A: Tom
+
+Q: Alice scored 80, Bob scored 90. What is the total?
+A: 170
+
+Q: Alice scored 80, Bob scored 90. What is the difference?
+A: 10
 """
 
 
@@ -1786,10 +1808,216 @@ def sanitize_raw_output(text: str) -> str:
 # SECTION 12: MAIN ANSWER PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _is_extraction_query(query: str) -> bool:
-    """Detect if a query is an extraction/processing type (raw output mode)."""
+# ==============================================================================
+# SECTION 12A: BOOLEAN YES/NO ENGINE (Level 3)
+# ==============================================================================
+
+def _is_perfect_square(n):
+    if n < 0: return False
+    root = int(math.isqrt(n))
+    return root * root == n
+
+def _is_fibonacci(n):
+    if n < 0: return False
+    return _is_perfect_square(5*n*n+4) or _is_perfect_square(5*n*n-4)
+
+def try_boolean_question(query):
+    """Handle yes/no questions. Returns ('YES'/'NO', True) or None."""
+    ql = query.lower().strip().rstrip("?. ")
+
+    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:an?\s+)?(even|odd)(?:\s+number)?", ql)
+    if m:
+        val = int(float(m.group(1)))
+        return ("YES" if (val % 2 == 0) == (m.group(2) == "even") else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+)\s+(?:a\s+)?prime(?:\s+number)?", ql)
+    if m:
+        return ("YES" if _is_prime(int(m.group(1))) else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+divisible\s+by\s+([+-]?\d+(?:\.\d+)?)", ql)
+    if m:
+        a, b = int(float(m.group(1))), int(float(m.group(2)))
+        return ("YES" if b != 0 and a % b == 0 else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(greater|larger|bigger|more)\s+than\s+([+-]?\d+(?:\.\d+)?)", ql)
+    if m:
+        return ("YES" if float(m.group(1)) > float(m.group(3)) else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(less|smaller|fewer)\s+than\s+([+-]?\d+(?:\.\d+)?)", ql)
+    if m:
+        return ("YES" if float(m.group(1)) < float(m.group(3)) else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+equal\s+to\s+([+-]?\d+(?:\.\d+)?)", ql)
+    if m:
+        return ("YES" if abs(float(m.group(1)) - float(m.group(2))) < 1e-9 else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+(?:a\s+)?(positive|negative|zero)(?:\s+number)?", ql)
+    if m:
+        val, chk = float(m.group(1)), m.group(2)
+        if chk == "positive": return ("YES" if val > 0 else "NO", True)
+        if chk == "negative": return ("YES" if val < 0 else "NO", True)
+        return ("YES" if val == 0 else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+)\s+(?:a\s+)?perfect\s+square", ql)
+    if m:
+        return ("YES" if _is_perfect_square(int(m.group(1))) else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+)\s+(?:a\s+)?fibonacci(?:\s+number)?", ql)
+    if m:
+        return ("YES" if _is_fibonacci(int(m.group(1))) else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+)\s+(?:a\s+)?multiple\s+of\s+([+-]?\d+)", ql)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return ("YES" if b != 0 and a % b == 0 else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+)\s+(?:a\s+)?factor\s+of\s+([+-]?\d+)", ql)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return ("YES" if a != 0 and b % a == 0 else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+(?:\.\d+)?)\s+between\s+([+-]?\d+(?:\.\d+)?)\s+and\s+([+-]?\d+(?:\.\d+)?)", ql)
+    if m:
+        val, lo, hi = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        if lo > hi: lo, hi = hi, lo
+        return ("YES" if lo <= val <= hi else "NO", True)
+
+    if re.search(r"is\s+.+\s+(?:a\s+)?palindrome", ql):
+        text = _extract_quoted_text(query)
+        if text:
+            c = re.sub(r"[^a-zA-Z0-9]", "", text).lower()
+            return ("YES" if c == c[::-1] else "NO", True)
+        m2 = re.search(r"is\s+(\w+)\s+(?:a\s+)?palindrome", ql)
+        if m2:
+            w = m2.group(1).lower()
+            return ("YES" if w == w[::-1] else "NO", True)
+
+    m = re.search(r"is\s+(\d{4})\s+(?:a\s+)?leap\s*year", ql)
+    if m:
+        return ("YES" if calendar.isleap(int(m.group(1))) else "NO", True)
+
+    m = re.search(r"is\s+([+-]?\d+)\s+(?:a\s+)?power\s+of\s+([+-]?\d+)", ql)
+    if m:
+        val, base = int(m.group(1)), int(m.group(2))
+        if base <= 1 or val <= 0:
+            return ("YES" if val == 1 else "NO", True)
+        n = val
+        while n > 1:
+            if n % base != 0: return ("NO", True)
+            n //= base
+        return ("YES", True)
+
+    m = re.search(r"is\s+([+-]?\d+)\s+(?:an?\s+)?(composite|natural|whole)(?:\s+number)?", ql)
+    if m:
+        val, chk = int(m.group(1)), m.group(2)
+        if chk == "composite": return ("YES" if val > 1 and not _is_prime(val) else "NO", True)
+        if chk == "natural": return ("YES" if val > 0 else "NO", True)
+        if chk == "whole": return ("YES" if val >= 0 else "NO", True)
+
+    m = re.search(r"can\s+([+-]?\d+)\s+be\s+divided\s+evenly\s+by\s+([+-]?\d+)", ql)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return ("YES" if b != 0 and a % b == 0 else "NO", True)
+
+    m = re.search(r'does\s+["\'](.+?)["\']\s+contain\s+["\'](.+?)["\']', query, re.IGNORECASE)
+    if m:
+        return ("YES" if m.group(2) in m.group(1) else "NO", True)
+
+    return None
+
+
+# ==============================================================================
+# SECTION 12B: COMPARISON / REASONING ENGINE (Level 5)
+# ==============================================================================
+
+def _extract_entity_values(text):
+    """Extract (name, value) pairs from text like 'Alice scored 80, Bob scored 90'."""
+    pairs = []
+    # Pattern: "Name verb Number" (Alice scored 80, Bob has 3, Tom earned $500)
+    for m in re.finditer(
+        r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s+"
+        r"(?:scored|score|has|have|had|got|gets|earned|earns|received|receives|made|makes|"
+        r"weighs|weigh|costs?|is|was|are|were|runs?|ran|finished|took|takes|spent|pays?|paid)\s+"
+        r"\$?([+-]?\d+(?:\.\d+)?)",
+        text,
+    ):
+        pairs.append((m.group(1).strip(), float(m.group(2))))
+    if pairs:
+        return pairs
+
+    # Pattern: "Name: Number" or "Name - Number"
+    for m in re.finditer(r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s*[:\-]\s*\$?(\d+(?:\.\d+)?)", text):
+        pairs.append((m.group(1).strip(), float(m.group(2))))
+    if pairs:
+        return pairs
+
+    # Pattern: lowercase names: "alice scored 80"
+    for m in re.finditer(
+        r"([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+"
+        r"(?:scored|has|had|got|earned|received|made|weighs|costs?|is|was)\s+"
+        r"\$?(\d+(?:\.\d+)?)",
+        text, re.IGNORECASE,
+    ):
+        name = m.group(1).strip()
+        if name.lower() not in {"who", "what", "which", "the", "a", "an", "it", "he", "she", "they", "and", "or", "but"}:
+            pairs.append((name, float(m.group(2))))
+    return pairs
+
+
+def try_comparison_query(query):
+    """Handle comparison/reasoning queries. Returns (answer, True) or None."""
+    q = query.strip()
+    ql = q.lower()
+
+    # Must contain a comparison question keyword
+    if not re.search(r"\b(who|which|what)\b.+\b(most|least|highest|lowest|best|worst|more|less|greater|smaller|bigger|cheaper|expensive|faster|slower|older|younger|taller|shorter|heavier|lighter|maximum|minimum|max|min|scored|total|sum|average|mean|difference|won|winner|lost|loser|first|last|top|bottom)\b", ql):
+        return None
+
+    # Split query into data part and question part
+    # Usually separated by period or question mark
+    parts = [p.strip() for p in re.split(r'[.?]\s*', q) if p.strip()]
+    data_part = parts[0] if parts else q
+    question_part = parts[-1].lower().strip() if len(parts) > 1 else ql
+
+    # Use full query text for entity extraction
+    entities = _extract_entity_values(q)
+    if len(entities) < 2:
+        return None
+
+    # Determine question type
+    # MAX: highest, most, best, greater, bigger, more, top, won, winner, older, taller, heavier, faster, expensive
+    if re.search(r"\b(highest|most|best|greater|bigger|more|top|won|winner|older|taller|heavier|faster|expensive|maximum|max)\b", question_part):
+        winner = max(entities, key=lambda x: x[1])
+        return winner[0], True
+
+    # MIN: lowest, least, worst, smaller, less, fewer, bottom, lost, loser, younger, shorter, lighter, slower, cheaper, minimum
+    if re.search(r"\b(lowest|least|worst|smaller|less|fewer|bottom|lost|loser|younger|shorter|lighter|slower|cheaper|cheapest|minimum|min)\b", question_part):
+        loser = min(entities, key=lambda x: x[1])
+        return loser[0], True
+
+    # TOTAL/SUM
+    if re.search(r"\b(total|sum|combined|altogether)\b", question_part):
+        return _format_number(sum(v for _, v in entities)), True
+
+    # AVERAGE/MEAN
+    if re.search(r"\b(average|mean|avg)\b", question_part):
+        return _format_number(sum(v for _, v in entities) / len(entities)), True
+
+    # DIFFERENCE
+    if re.search(r"\b(difference|gap|margin)\b", question_part):
+        vals = [v for _, v in entities]
+        return _format_number(abs(max(vals) - min(vals))), True
+
+    # COUNT
+    if re.search(r"\bhow\s+many\b", question_part):
+        return str(len(entities)), True
+
+    return None
+
+
+def _is_extraction_query(query):
     ql = query.lower().strip()
-    extraction_patterns = [
+    patterns = [
         r"^extract\s+", r"^reverse\s+", r"^convert\s+.+\s+to\s+(?:upper|lower|binary|hex|octal|decimal|roman)",
         r"^sort\s+", r"^count\s+", r"^find\s+(?:the\s+)?(?:max|min|largest|smallest|common)",
         r"^remove\s+", r"^replace\s+", r"^concatenate\s+", r"^split\s+",
@@ -1797,90 +2025,82 @@ def _is_extraction_query(query: str) -> bool:
         r"^(?:how\s+many|what(?:'s|\s+is)\s+(?:the\s+)?length)",
         r"^is\s+.+\s+(?:a\s+)?palindrome",
         r"^(?:first|last)\s+\d+\s+(?:char|letter)",
-        r"^repeat\s+",
-        r"^(?:what|which)\s+day\s+",
-        r"^how\s+many\s+days?\s+",
-        r"^is\s+\d{4}\s+.*leap",
-        r"^unique\s+",
-        r"word\s+count", r"character\s+count", r"char\s+count",
+        r"^repeat\s+", r"^(?:what|which)\s+day\s+",
+        r"^how\s+many\s+days?\s+", r"^is\s+\d{4}\s+.*leap",
+        r"^unique\s+", r"word\s+count", r"character\s+count",
+        r"^is\s+", r"^does\s+", r"^can\s+",
+        r"who\s+(?:scored|has|had|got|earned|won|is|was)",
+        r"which\s+(?:is|was|has|had)",
     ]
-    for pattern in extraction_patterns:
-        if re.search(pattern, ql):
-            return True
-    return False
+    return any(re.search(p, ql) for p in patterns)
 
 
-def generate_answer(query: str, assets: list) -> Tuple[str, bool]:
+def generate_answer(query, assets):
     """
-    Main answer pipeline. Returns (answer, is_raw).
-    is_raw=True means output should not have sentence formatting.
-
-    Pipeline:
-    1. Text extraction (raw mode)
-    2. String operations (raw mode)
-    3. List operations (raw mode)
-    4. Number base conversion (raw mode)
-    5. Date operations (raw mode)
-    6. Arithmetic (sentence mode)
-    7. Unit/temp conversion (sentence mode)
-    8. Gemini LLM
-    9. DuckDuckGo → Wikipedia → Extractive fallbacks
+    Main pipeline. Returns (answer, is_raw).
+    Order: boolean -> comparison -> extraction -> string -> list -> base -> date -> arith -> conv -> gemini -> fallbacks
     """
     context = _assets_context(assets)
 
-    # ── Step 1: Text extraction ──
+    # 1. Boolean yes/no (Level 3)
+    result = try_boolean_question(query)
+    if result is not None:
+        return result
+
+    # 2. Comparison/reasoning (Level 5)
+    result = try_comparison_query(query)
+    if result is not None:
+        return result
+
+    # 3. Text extraction (Level 2)
     result = try_text_extraction(query)
     if result is not None:
-        return result  # Already a (str, bool) tuple
+        return result
 
-    # ── Step 2: String operations ──
+    # 4. String operations
     result = try_string_operation(query)
     if result is not None:
         return result
 
-    # ── Step 3: List operations ──
+    # 5. List operations
     result = try_list_operation(query)
     if result is not None:
         return result
 
-    # ── Step 4: Number base conversion ──
+    # 6. Number base conversion
     result = try_number_base_conversion(query)
     if result is not None:
         return result
 
-    # ── Step 5: Date operations ──
+    # 7. Date operations
     result = try_date_operation(query)
     if result is not None:
         return result
 
-    # ── Step 6: Arithmetic ──
-    arith_result = parse_arithmetic_query(query)
-    if arith_result is not None:
-        return arith_result, False
+    # 8. Arithmetic (Level 1)
+    arith = parse_arithmetic_query(query)
+    if arith is not None:
+        return arith, False
 
-    # ── Step 7: Conversions ──
-    conv_result = try_conversion(query)
-    if conv_result is not None:
-        return conv_result, False
+    # 9. Conversions
+    conv = try_conversion(query)
+    if conv is not None:
+        return conv, False
 
-    # ── Step 8: Gemini LLM ──
-    is_raw_query = _is_extraction_query(query)
-    gemini_result = _call_gemini(query, context)
-    if gemini_result:
-        return gemini_result, is_raw_query
+    # 10. Gemini LLM
+    is_raw = _is_extraction_query(query)
+    gemini = _call_gemini(query, context)
+    if gemini:
+        return gemini, is_raw
 
-    # ── Step 9: Fallbacks ──
-    ddg_result = _duckduckgo_answer(query)
-    if ddg_result:
-        return ddg_result, False
-
-    wiki_result = _wikipedia_summary(query)
-    if wiki_result:
-        return wiki_result, False
-
-    extractive = _extractive_answer(query, context)
-    if extractive:
-        return extractive, False
+    # 11. Fallbacks
+    for fn in [_duckduckgo_answer, _wikipedia_summary]:
+        r = fn(query)
+        if r:
+            return r, False
+    ext = _extractive_answer(query, context)
+    if ext:
+        return ext, False
 
     return "I cannot determine the answer.", False
 
@@ -1975,7 +2195,7 @@ def answer():
 @app.route("/health", methods=["GET"])
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "version": "3.0"}), 200
+    return jsonify({"status": "ok", "version": "5.0"}), 200
 
 
 @app.errorhandler(405)
